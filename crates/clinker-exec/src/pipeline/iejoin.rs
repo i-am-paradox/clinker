@@ -950,18 +950,19 @@ fn record_unaccounted_held_cost(
 }
 
 /// Resident byte cost of one held build candidate: the cloned record plus the
-/// build row id held beside it.
-fn candidate_held_cost(record: &Record) -> u64 {
-    record_held_cost(record) + std::mem::size_of::<RecordOrder>() as u64
+/// `R` held beside it (the build row id for a `First` candidate, nothing for
+/// the collect `$ck` build).
+fn candidate_held_cost<R>(record: &Record) -> u64 {
+    record_held_cost(record) + std::mem::size_of::<R>() as u64
 }
 
 /// [`candidate_held_cost`] net of the record heap the allocation resources
 /// already account for.
-fn candidate_unaccounted_held_cost(
+fn candidate_unaccounted_held_cost<R>(
     record: &Record,
     resources: &clinker_record::owned_storage::AllocationResources,
 ) -> u64 {
-    record_unaccounted_held_cost(record, resources) + std::mem::size_of::<RecordOrder>() as u64
+    record_unaccounted_held_cost(record, resources) + std::mem::size_of::<R>() as u64
 }
 fn collect_entry_unaccounted_cost(
     entry: &CollectEntry,
@@ -978,32 +979,32 @@ fn collect_entry_unaccounted_cost(
 /// (determinism-critical) lives in one place. A free function so the caller can
 /// pass two disjoint `MatchState` fields (`&mut self.first_match`,
 /// `&mut self.held_bytes`) without aliasing.
-fn keep_min(
+fn keep_min<R: Copy>(
     resources: &clinker_record::owned_storage::AllocationResources,
     unaccounted_bytes: &mut u64,
-    map: &mut HashMap<usize, (u64, Record, RecordOrder)>,
+    map: &mut HashMap<usize, (u64, Record, R)>,
     held_bytes: &mut u64,
     key: usize,
-    candidate: (u64, &Record, RecordOrder),
+    candidate: (u64, &Record, R),
 ) {
     let (idx, record, row) = candidate;
     match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut e) if idx < e.get().0 => {
             let cloned = record.clone();
-            *held_bytes = held_bytes.saturating_sub(candidate_held_cost(&e.get().1));
-            *held_bytes = held_bytes.saturating_add(candidate_held_cost(&cloned));
+            *held_bytes = held_bytes.saturating_sub(candidate_held_cost::<R>(&e.get().1));
+            *held_bytes = held_bytes.saturating_add(candidate_held_cost::<R>(&cloned));
             *unaccounted_bytes = unaccounted_bytes
-                .saturating_sub(candidate_unaccounted_held_cost(&e.get().1, resources));
+                .saturating_sub(candidate_unaccounted_held_cost::<R>(&e.get().1, resources));
             *unaccounted_bytes = unaccounted_bytes
-                .saturating_add(candidate_unaccounted_held_cost(&cloned, resources));
+                .saturating_add(candidate_unaccounted_held_cost::<R>(&cloned, resources));
             e.insert((idx, cloned, row));
         }
         std::collections::hash_map::Entry::Occupied(_) => {}
         std::collections::hash_map::Entry::Vacant(e) => {
             let cloned = record.clone();
-            *held_bytes = held_bytes.saturating_add(candidate_held_cost(&cloned));
+            *held_bytes = held_bytes.saturating_add(candidate_held_cost::<R>(&cloned));
             *unaccounted_bytes = unaccounted_bytes
-                .saturating_add(candidate_unaccounted_held_cost(&cloned, resources));
+                .saturating_add(candidate_unaccounted_held_cost::<R>(&cloned, resources));
             e.insert((idx, cloned, row));
         }
     }
@@ -1030,7 +1031,7 @@ struct MatchState<'a> {
     /// a pure function of the data on the block path (min build input index),
     /// and the first-visited build on the equi+range path (min insertion
     /// counter) — matching that path's prior behavior.
-    first_collected_builds: HashMap<usize, (u64, Record, RecordOrder)>,
+    first_collected_builds: HashMap<usize, (u64, Record, ())>,
     /// The block path's `First`-mode candidate per driver: the residual-passing
     /// match with the smallest build input index, held until the driver block
     /// finalizes and emits it, with the build row id its dead letter reports.
@@ -1083,20 +1084,14 @@ impl<'a> MatchState<'a> {
     /// user fields, keep the bounded smallest-`order_key` set, and track the
     /// min-`order_key` build for `$ck`. Marking a driver truncated once its
     /// heap is full and a further match cannot displace a kept element.
-    fn record_collect_match(
-        &mut self,
-        key: usize,
-        order_key: u64,
-        build_record: &Record,
-        build_row: RecordOrder,
-    ) {
+    fn record_collect_match(&mut self, key: usize, order_key: u64, build_record: &Record) {
         keep_min(
             self.allocation_resources,
             &mut self.unaccounted_held_bytes,
             &mut self.first_collected_builds,
             &mut self.held_bytes,
             key,
-            (order_key, build_record, build_row),
+            (order_key, build_record, ()),
         );
         // Build-side records contribute only their user-declared field values:
         // `iter_user_fields` filters every engine-stamped column (`$ck.*`
@@ -1164,17 +1159,18 @@ impl<'a> MatchState<'a> {
                 None => Vec::new(),
             };
         let truncated = self.collect_truncated.remove(&key).is_some();
-        let first_build =
-            match self.first_collected_builds.remove(&key) {
-                Some((_, r, _)) => {
-                    self.held_bytes = self.held_bytes.saturating_sub(candidate_held_cost(&r));
-                    self.unaccounted_held_bytes = self.unaccounted_held_bytes.saturating_sub(
-                        candidate_unaccounted_held_cost(&r, self.allocation_resources),
-                    );
-                    Some(r)
-                }
-                None => None,
-            };
+        let first_build = match self.first_collected_builds.remove(&key) {
+            Some((_, r, ())) => {
+                self.held_bytes = self
+                    .held_bytes
+                    .saturating_sub(candidate_held_cost::<()>(&r));
+                self.unaccounted_held_bytes = self.unaccounted_held_bytes.saturating_sub(
+                    candidate_unaccounted_held_cost::<()>(&r, self.allocation_resources),
+                );
+                Some(r)
+            }
+            None => None,
+        };
         CollectFlush {
             arr,
             truncated,
@@ -1207,10 +1203,12 @@ impl<'a> MatchState<'a> {
     fn take_first_candidate(&mut self, key: usize) -> Option<(u64, Record, RecordOrder)> {
         let taken = self.first_match.remove(&key);
         if let Some((_, ref r, _)) = taken {
-            self.held_bytes = self.held_bytes.saturating_sub(candidate_held_cost(r));
+            self.held_bytes = self
+                .held_bytes
+                .saturating_sub(candidate_held_cost::<RecordOrder>(r));
             self.unaccounted_held_bytes =
                 self.unaccounted_held_bytes
-                    .saturating_sub(candidate_unaccounted_held_cost(
+                    .saturating_sub(candidate_unaccounted_held_cost::<RecordOrder>(
                         r,
                         self.allocation_resources,
                     ));
@@ -1446,7 +1444,7 @@ fn emit_pairs(
             MatchMode::Collect => {
                 // Order key: the build's input index, so the kept set and array
                 // order are a deterministic function of the data.
-                state.record_collect_match(key, bidx, build_record, build_row);
+                state.record_collect_match(key, bidx, build_record);
                 // Bound the collect accumulators as they grow: they hold up to
                 // COLLECT_PER_GROUP_CAP cloned build records per driver, are never
                 // spilled, and drain only at the driver-block finalize — so a hot
@@ -2031,16 +2029,19 @@ mod tests {
         use std::num::NonZeroUsize;
 
         fn assert_retained(state: &MatchState<'_>) {
-            let records = state
-                .first_match
-                .values()
-                .chain(state.first_collected_builds.values())
-                .map(|(_, record, _)| record);
             let mut physical = 0;
             let mut relative = 0;
-            for record in records {
-                physical += candidate_held_cost(record);
-                relative += candidate_unaccounted_held_cost(record, state.allocation_resources);
+            for (_, record, _) in state.first_match.values() {
+                physical += candidate_held_cost::<RecordOrder>(record);
+                relative += candidate_unaccounted_held_cost::<RecordOrder>(
+                    record,
+                    state.allocation_resources,
+                );
+            }
+            for (_, record, ()) in state.first_collected_builds.values() {
+                physical += candidate_held_cost::<()>(record);
+                relative +=
+                    candidate_unaccounted_held_cost::<()>(record, state.allocation_resources);
             }
             for entry in state.collect_accum.values().flat_map(|heap| heap.iter()) {
                 physical += collect_entry_cost(entry);
@@ -2088,7 +2089,7 @@ mod tests {
                 let mut collect = MatchState::new(1, &resources);
                 for index in [9, 7, 4, 1] {
                     first.note_first_candidate(0, index, &input, index.into());
-                    collect.record_collect_match(0, index, &input, index.into());
+                    collect.record_collect_match(0, index, &input);
                     assert_retained(&first);
                     assert_retained(&collect);
                     assert_eq!(first.first_match[&0].0, index);
@@ -2173,7 +2174,7 @@ mod tests {
             )),
         };
         let floor = 71;
-        let actual_peak = floor + candidate_held_cost(&stored) + collect_entry_cost(&entry);
+        let actual_peak = floor + candidate_held_cost::<()>(&stored) + collect_entry_cost(&entry);
         assert!(record_held_cost(&input) > record_held_cost(&stored));
         let stable = StableEvalContext::test_default();
         let ctx = EvalContext::test_default_borrowed(&stable);
