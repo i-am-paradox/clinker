@@ -13,7 +13,9 @@ use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator, SkipReason};
 use super::RecordOrder;
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{CombineOutputEvalFailure, ProbeIter};
+use crate::pipeline::combine::{
+    CombineOutputEvalFailure, MatchedBuildFailure, ProbeIter, matched_build_row,
+};
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::DecomposedPredicate;
@@ -42,27 +44,6 @@ pub(crate) enum ProbeOutcome<'a> {
 pub(crate) struct ProbeMatches<'a> {
     pub(crate) candidates: ProbeIter<'a>,
     pub(crate) build_rows: &'a [RecordOrder],
-}
-
-/// The build row id of the candidate at `index`, or the invariant
-/// violation [`ProbeMatches`] documents.
-fn candidate_row(
-    build_rows: &[RecordOrder],
-    index: usize,
-    name: &str,
-) -> Result<RecordOrder, PipelineError> {
-    build_rows
-        .get(index)
-        .copied()
-        .ok_or_else(|| PipelineError::Internal {
-            op: "grace_hash probe",
-            node: name.to_string(),
-            detail: format!(
-                "hash table candidate index {index} has no build row id; the partition holds {} \
-                 build row ids",
-                build_rows.len()
-            ),
-        })
 }
 
 /// Mutable emission targets threaded through every grace-hash emit path
@@ -154,7 +135,7 @@ pub(super) fn emit_for_probe<'a>(
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
             for cand in probe_iter {
-                let row = candidate_row(build_rows, cand.index, name)?;
+                let row = matched_build_row(build_rows, cand.index, "grace_hash probe", name)?;
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
                         CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -176,7 +157,10 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((cand.record.clone(), row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: cand.record.clone(),
+                                    row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
@@ -230,7 +214,7 @@ pub(super) fn emit_for_probe<'a>(
             let matched: Vec<(Record, RecordOrder)> = {
                 let mut acc: Vec<(Record, RecordOrder)> = Vec::new();
                 for cand in probe_iter {
-                    let row = candidate_row(build_rows, cand.index, name)?;
+                    let row = matched_build_row(build_rows, cand.index, "grace_hash probe", name)?;
                     if let Some(residual) = decomposed.residual.as_ref() {
                         let resolver =
                             CombineResolver::new(resolver_mapping, probe_record, Some(cand.record));
@@ -252,7 +236,10 @@ pub(super) fn emit_for_probe<'a>(
                                 sink.failures.push(CombineOutputEvalFailure {
                                     probe_record: probe_record.clone(),
                                     row: rn,
-                                    matched_build: Some((cand.record.clone(), row)),
+                                    matched_build: Some(MatchedBuildFailure {
+                                        record: cand.record.clone(),
+                                        row,
+                                    }),
                                     error: e,
                                     failed_at: crate::executor::DlqFailureStamp::now(),
                                 });
@@ -365,7 +352,10 @@ pub(super) fn emit_for_probe<'a>(
                             sink.failures.push(CombineOutputEvalFailure {
                                 probe_record: probe_record.clone(),
                                 row: rn,
-                                matched_build: Some((m.clone(), *build_row)),
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: m.clone(),
+                                    row: *build_row,
+                                }),
                                 error: e,
                                 failed_at: crate::executor::DlqFailureStamp::now(),
                             });
