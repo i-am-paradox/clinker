@@ -116,6 +116,12 @@ pub(crate) enum ObservabilityRuntimeError {
     Budget(OtlpDeliveryBudgetError),
     Arena(TelemetryArenaError),
     Worker,
+    /// A debug-build test seam was asked for with a value it cannot use. A seam
+    /// that quietly ran unheld would turn a deadline race into a clean run.
+    #[cfg(debug_assertions)]
+    InjectedFaultMalformed {
+        variable: &'static str,
+    },
 }
 
 impl fmt::Display for ObservabilityRuntimeError {
@@ -132,6 +138,11 @@ impl fmt::Display for ObservabilityRuntimeError {
             Self::Worker => formatter.write_str(
                 "the bounded observability exporter could not start before execution. Correction: reduce host resource pressure or disable observability",
             ),
+            #[cfg(debug_assertions)]
+            Self::InjectedFaultMalformed { variable } => write!(
+                formatter,
+                "{variable} is not a whole number of milliseconds. Correction: set it to one, or unset it"
+            ),
         }
     }
 }
@@ -143,6 +154,8 @@ impl std::error::Error for ObservabilityRuntimeError {
             Self::Budget(error) => Some(error),
             Self::Arena(error) => Some(error),
             Self::CredentialUnresolved | Self::Worker => None,
+            #[cfg(debug_assertions)]
+            Self::InjectedFaultMalformed { .. } => None,
         }
     }
 }
@@ -478,16 +491,24 @@ enum WorkerCommand {
 /// The real condition needs a collector that accepts a connection and then
 /// does not answer, which no offline test has. Holding the worker here reaches
 /// the same branch — the flush deadline expires, `finish` detaches the worker,
-/// and the arena is read while that worker is still draining it.
+/// and the arena is read while that worker is still draining it. Applied at
+/// the start of every final flush, so the drain a dropped worker requests on
+/// an early return is held the same way and that path's own deadline is
+/// exercised too.
+///
+/// Read once, when the worker starts, so a value the seam cannot use stops the
+/// run there rather than letting a deadline race run unheld.
 #[cfg(debug_assertions)]
-fn injected_flush_hold() {
-    let Some(millis) = std::env::var_os("CLINKER_TEST_OTLP_FLUSH_HOLD_MS") else {
-        return;
+fn injected_flush_hold() -> Result<Option<Duration>, ObservabilityRuntimeError> {
+    const VARIABLE: &str = "CLINKER_TEST_OTLP_FLUSH_HOLD_MS";
+    let Some(millis) = std::env::var_os(VARIABLE) else {
+        return Ok(None);
     };
-    let Ok(millis) = millis.to_string_lossy().parse::<u64>() else {
-        return;
-    };
-    thread::sleep(Duration::from_millis(millis));
+    millis
+        .to_str()
+        .and_then(|millis| millis.parse::<u64>().ok())
+        .map(|millis| Some(Duration::from_millis(millis)))
+        .ok_or(ObservabilityRuntimeError::InjectedFaultMalformed { variable: VARIABLE })
 }
 
 /// One finite run's sole telemetry receiver and blocking exporter worker.
@@ -500,6 +521,12 @@ pub(crate) struct OtlpWorker {
     /// The worker's counters as of its last delivery, readable without the
     /// completion channel.
     progress: Arc<Mutex<ObservabilitySummary>>,
+    /// Whether a test is holding the final flush, in which case a dropped
+    /// worker reports how its drain wait ended. Nothing else a test can see
+    /// records that: the drain of a run that never reached its terminal
+    /// delivers no summary.
+    #[cfg(debug_assertions)]
+    flush_held: bool,
 }
 
 impl OtlpWorker {
@@ -526,6 +553,8 @@ impl OtlpWorker {
         correlation: RunCorrelation<String>,
         backend: DeliveryBackend,
     ) -> Result<Self, ObservabilityRuntimeError> {
+        #[cfg(debug_assertions)]
+        let flush_hold = injected_flush_hold()?;
         let mut payload = BoundedPayload::new(bundle.arena.request_capacity_bytes())?;
         let (command, commands) = mpsc::sync_channel(1);
         let (done_sender, done) = mpsc::sync_channel(1);
@@ -551,13 +580,13 @@ impl OtlpWorker {
                     trace_id: new_trace_id(),
                     next_span_id: RUN_SPAN_ID.saturating_add(1),
                     metrics_window_start_unix_nanos: unix_nanos_now(),
+                    #[cfg(debug_assertions)]
+                    flush_hold,
                 };
                 loop {
                     state.drain_available();
                     match commands.recv_timeout(IDLE_POLL) {
                         Ok(WorkerCommand::Finish(snapshot)) => {
-                            #[cfg(debug_assertions)]
-                            injected_flush_hold();
                             state.enter_final_flush();
                             state.drain_final();
                             state.deliver_lifecycle(snapshot.as_ref());
@@ -592,6 +621,8 @@ impl OtlpWorker {
             stop,
             flush_timeout,
             progress,
+            #[cfg(debug_assertions)]
+            flush_held: flush_hold.is_some(),
         })
     }
 
@@ -683,10 +714,18 @@ impl Drop for OtlpWorker {
         }
         match self.done.recv_timeout(self.flush_timeout) {
             Ok(report) => {
+                #[cfg(debug_assertions)]
+                if self.flush_held {
+                    eprintln!("clinker-test: dropped OTLP exporter drain finished");
+                }
                 let _ = handle.join();
                 report.report_failures();
             }
             Err(_) => {
+                #[cfg(debug_assertions)]
+                if self.flush_held {
+                    eprintln!("clinker-test: dropped OTLP exporter abandoned its drain");
+                }
                 self.stop.store(true, Ordering::Release);
                 // Same bound as the flush that timed out: a still-active
                 // transport call remains capped by the admitted retry-total
@@ -729,6 +768,10 @@ struct WorkerState<'a> {
     next_span_id: u64,
     /// Start of the delta window the next drained counters describe.
     metrics_window_start_unix_nanos: u64,
+    /// How long a test holds every final flush before it begins; see
+    /// [`injected_flush_hold`].
+    #[cfg(debug_assertions)]
+    flush_hold: Option<Duration>,
 }
 
 impl WorkerState<'_> {
@@ -743,6 +786,11 @@ impl WorkerState<'_> {
     /// parent when its flush deadline expires — abandons a delivery, which is
     /// what keeps the flush bounded.
     fn enter_final_flush(&mut self) {
+        #[cfg(debug_assertions)]
+        if let Some(hold) = self.flush_hold {
+            eprintln!("clinker-test: OTLP final flush held");
+            thread::sleep(hold);
+        }
         self.final_flush = true;
     }
 
