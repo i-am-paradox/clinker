@@ -50,6 +50,28 @@ fn test_stats_sink<'a>(
     }
 }
 
+thread_local! {
+    static NEXT_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The next build arrival position on this test's thread, so the build rows
+/// a test adds rise in arrival order as the build input would deliver them.
+fn fresh_seq() -> crate::pipeline::combine::BuildSeq {
+    NEXT_SEQ.with(|next| {
+        let seq = next.get();
+        next.set(seq + 1);
+        crate::pipeline::combine::BuildSeq(seq)
+    })
+}
+
+/// `records` with their build arrival positions, in the order given.
+fn with_seqs(records: Vec<Record>) -> Vec<(Record, crate::pipeline::combine::BuildSeq)> {
+    records
+        .into_iter()
+        .map(|record| (record, fresh_seq()))
+        .collect()
+}
+
 fn record_for(schema: &SharedStorage<Schema>, values: Vec<Value>) -> Record {
     Record::new(schema.clone(), values)
 }
@@ -154,7 +176,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
     // Deposit a record and force a spill so a file actually exists.
     let rec = record_for(&schema, vec![Value::Integer(7)]);
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-    exec.add_build_record(rec, 0, &budget).unwrap();
+    exec.add_build_record(rec, fresh_seq(), 0, &budget).unwrap();
     exec.spill_partition(0, &budget).unwrap();
     let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
     assert!(spilled_inside >= 1, "spill_partition must commit a file");
@@ -192,7 +214,7 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
         let schema = schema_with(&["k"]);
         let rec = record_for(&schema, vec![Value::Integer(99)]);
         let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
-        exec.add_build_record(rec, 0, &budget).unwrap();
+        exec.add_build_record(rec, fresh_seq(), 0, &budget).unwrap();
         exec.spill_partition(0, &budget).unwrap();
         panic!("simulated mid-spill panic");
     }));
@@ -228,7 +250,8 @@ fn spill_activates_under_tiny_budget() {
         );
         // Synthetic hash: distribute uniformly across 16 partitions.
         let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        exec.add_build_record(rec, hash, &budget).unwrap();
+        exec.add_build_record(rec, fresh_seq(), hash, &budget)
+            .unwrap();
     }
     let on_disk = exec
         .partitions
@@ -284,7 +307,7 @@ fn spill_activates_on_charged_bytes_without_rss() {
         &schema,
         vec![Value::Integer(0), Value::String("row-0".into())],
     );
-    exec.add_build_record(rec, 0, &budget).unwrap();
+    exec.add_build_record(rec, fresh_seq(), 0, &budget).unwrap();
 
     let on_disk = exec
         .partitions
@@ -322,7 +345,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
     let probe_partition_hash: u64 = 0x0000_0000_0000_1234;
     for i in 0..64i64 {
         let rec = record_for(&schema, vec![Value::Integer(i)]);
-        exec.add_build_record(rec, probe_partition_hash, &budget)
+        exec.add_build_record(rec, fresh_seq(), probe_partition_hash, &budget)
             .unwrap();
     }
     // Force spill of partition 0.
@@ -1069,7 +1092,7 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
             ],
         );
         let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        match exec.add_build_record(rec, hash, &budget) {
+        match exec.add_build_record(rec, fresh_seq(), hash, &budget) {
             Ok(()) => fed += 1,
             Err(e) => {
                 hit = Some(e);
@@ -1174,6 +1197,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             &schema,
             vec![Value::Integer(0), Value::String("seed".into())],
         ),
+        fresh_seq(),
         hash_p0,
         &budget,
     )
@@ -1199,7 +1223,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
             &schema,
             vec![Value::Integer(i), Value::String(format!("row-{i}").into())],
         );
-        match exec.add_build_record(rec, hash_p0, &budget) {
+        match exec.add_build_record(rec, fresh_seq(), hash_p0, &budget) {
             Ok(()) => fed += 1,
             Err(e) => {
                 hit = Some(e);
@@ -1283,12 +1307,14 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
     // Drive partitions 0 and 1 OnDisk by hand (cap unlimited during build).
     exec.add_build_record(
         record_for(&schema, vec![Value::Integer(0)]),
+        fresh_seq(),
         hash_p0,
         &budget,
     )
     .unwrap();
     exec.add_build_record(
         record_for(&schema, vec![Value::Integer(1)]),
+        fresh_seq(),
         hash_p1,
         &budget,
     )
@@ -1430,7 +1456,8 @@ fn build_spill_reload_records_match() {
         })
         .collect();
     for (i, r) in originals.iter().enumerate() {
-        exec.add_build_record(r.clone(), i as u64, &budget).unwrap();
+        exec.add_build_record(r.clone(), fresh_seq(), i as u64, &budget)
+            .unwrap();
     }
     // Force-spill every partition.
     for idx in 0..exec.partitions.len() {
@@ -1442,7 +1469,7 @@ fn build_spill_reload_records_match() {
         for path in &sp.build_files {
             let reader = GraceSpillReader::open(path, schema.clone()).unwrap();
             for r in reader {
-                reloaded.push(r.unwrap());
+                reloaded.push(r.unwrap().0);
             }
         }
     }
@@ -1677,7 +1704,7 @@ fn spill_for_bnl(
     let mut bw = GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id, true).unwrap();
     let mut sketch = GraceHll::new();
     for r in build_records {
-        bw.write_record(r).unwrap();
+        bw.write_record(r, fresh_seq()).unwrap();
         // Feed the HLL via the build-side hash of the join key.
         let stable = cxl::eval::StableEvalContext::test_default();
         let source_file: Arc<str> = Arc::from("test.csv");
@@ -1786,7 +1813,7 @@ fn test_skew_detection_triggers_bnl() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -1846,7 +1873,7 @@ fn test_bnl_fallback_correct_output() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -1937,7 +1964,7 @@ fn test_bnl_bounded_memory() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2007,7 +2034,7 @@ fn test_bnl_bounded_memory() {
         bnl_fallback(
             rc,
             &sp2,
-            builds2,
+            with_seqs(builds2),
             &mut body_eval2,
             &big_budget,
             &mut GraceEmitSink {
@@ -2074,7 +2101,7 @@ fn test_bnl_result_batching() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2141,7 +2168,7 @@ fn test_e310_hard_limit_abort() {
         bnl_fallback(
             rc,
             &sp,
-            builds,
+            with_seqs(builds),
             &mut body_eval,
             &budget,
             &mut GraceEmitSink {
@@ -2173,5 +2200,227 @@ fn test_e310_hard_limit_abort() {
         other => {
             panic!("BNL hard-limit abort must surface MemoryBudgetExceeded; got {other:?}")
         }
+    }
+}
+
+/// Driver keys `0..GRACE_ORDER_KEYS`; each key has [`GRACE_ORDER_PER_KEY`]
+/// build rows, delivered interleaved across keys so a key's rows are not
+/// adjacent in the build input.
+const GRACE_ORDER_KEYS: i64 = 8;
+const GRACE_ORDER_PER_KEY: i64 = 3;
+
+/// Run a body-less grace-hash join of drivers `0..GRACE_ORDER_KEYS` against
+/// builds named `b-<key>-<n>`, where `n` is the row's position among its
+/// key's build rows in arrival order, under `match_mode` and `budget`.
+/// Returns the output records in emitted order.
+fn run_grace_arrival_order(
+    match_mode: clinker_plan::config::pipeline_node::MatchMode,
+    budget: &MemoryArbitrator,
+) -> Vec<Record> {
+    use crate::executor::combine::CombineResolverMapping;
+    use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
+    use clinker_plan::plan::types::JoinSide;
+    use cxl::eval::{EvalContext, StableEvalContext};
+
+    let driver_schema = schema_with(&["dk", "v"]);
+    let build_schema = schema_with(&["bk", "name"]);
+    let drivers: Vec<(Record, RecordOrder)> = (0..GRACE_ORDER_KEYS)
+        .map(|i| {
+            (
+                Record::new(
+                    driver_schema.clone(),
+                    vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
+                ),
+                (i as u64).into(),
+            )
+        })
+        .collect();
+    let builds: Vec<Record> = (0..GRACE_ORDER_PER_KEY)
+        .flat_map(|n| (0..GRACE_ORDER_KEYS).map(move |k| (k, n)))
+        .map(|(k, n)| {
+            Record::new(
+                build_schema.clone(),
+                vec![
+                    Value::Integer(k),
+                    Value::String(format!("b-{k}-{n}").into()),
+                ],
+            )
+        })
+        .collect();
+
+    let (left_tp, left_expr) =
+        compile_key("emit k = dk", &["dk"], &[("dk", cxl::typecheck::Type::Int)]);
+    let (right_tp, right_expr) =
+        compile_key("emit k = bk", &["bk"], &[("bk", cxl::typecheck::Type::Int)]);
+    let decomposed = DecomposedPredicate {
+        equalities: vec![EqualityConjunct {
+            left_expr,
+            left_input: Arc::from("orders"),
+            left_program: left_tp,
+            right_expr,
+            right_input: Arc::from("products"),
+            right_program: right_tp,
+        }],
+        ranges: Vec::new(),
+        residual: None,
+    };
+
+    let mut mapping_q: std::collections::HashMap<
+        clinker_plan::plan::row_type::QualifiedField,
+        (JoinSide, u32),
+    > = std::collections::HashMap::new();
+    for (input, field, side, index) in [
+        ("orders", "dk", JoinSide::Probe, 0),
+        ("orders", "v", JoinSide::Probe, 1),
+        ("products", "bk", JoinSide::Build, 0),
+        ("products", "name", JoinSide::Build, 1),
+    ] {
+        mapping_q.insert(
+            clinker_plan::plan::row_type::QualifiedField::qualified(input, field),
+            (side, index),
+        );
+    }
+    let row = |cols: &[(&str, cxl::typecheck::Type)]| {
+        let mut row_cols: indexmap::IndexMap<
+            clinker_plan::plan::row_type::QualifiedField,
+            cxl::typecheck::Type,
+        > = indexmap::IndexMap::new();
+        for (name, ty) in cols {
+            row_cols.insert(
+                clinker_plan::plan::row_type::QualifiedField::bare(*name),
+                ty.clone(),
+            );
+        }
+        clinker_plan::plan::row_type::Row::closed(row_cols, CxlSpan::new(0, 0))
+    };
+    let mut combine_inputs: indexmap::IndexMap<String, clinker_plan::plan::combine::CombineInput> =
+        indexmap::IndexMap::new();
+    combine_inputs.insert(
+        "orders".to_string(),
+        clinker_plan::plan::combine::CombineInput {
+            upstream_name: Arc::from("orders"),
+            producer_port: None,
+            row: row(&[
+                ("dk", cxl::typecheck::Type::Int),
+                ("v", cxl::typecheck::Type::String),
+            ]),
+        },
+    );
+    combine_inputs.insert(
+        "products".to_string(),
+        clinker_plan::plan::combine::CombineInput {
+            upstream_name: Arc::from("products"),
+            producer_port: None,
+            row: row(&[
+                ("bk", cxl::typecheck::Type::Int),
+                ("name", cxl::typecheck::Type::String),
+            ]),
+        },
+    );
+    let resolver_mapping =
+        CombineResolverMapping::from_pre_resolved(&Arc::new(mapping_q), &combine_inputs);
+
+    let stable = StableEvalContext::test_default();
+    let source_file: Arc<str> = Arc::from("test.csv");
+    let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
+    let combined_schema = SchemaBuilder::new()
+        .with_field("dk")
+        .with_field("v")
+        .with_field("bk")
+        .with_field("name")
+        .build();
+    let dir = tempfile::Builder::new()
+        .prefix("gh-arrival-order-")
+        .tempdir()
+        .unwrap();
+    let stats_catalog = fresh_stats_catalog();
+    execute_combine_grace_hash(GraceHashExec {
+        name: "grace_arrival_order",
+        build_qualifier: "products",
+        driver_records: drivers,
+        build_records: builds,
+        decomposed: &decomposed,
+        body_program: None,
+        resolver_mapping: &resolver_mapping,
+        output_schema: Some(&combined_schema),
+        match_mode,
+        on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+        max_output_rows: None,
+        partition_bits: 2,
+        propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+        ctx: &ctx,
+        budget,
+        spill_dir: dir.path(),
+        spill_compress: true,
+        consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+        strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        stats_sink: test_stats_sink(&stats_catalog, "products", "products"),
+    })
+    .expect("grace hash arrival-order run")
+    .records
+    .into_iter()
+    .map(|(record, _)| record)
+    .collect()
+}
+
+/// Each driver's output, as `(driver key, build name)` pairs in emitted
+/// order, grouped by driver key.
+fn grace_pairs_by_driver(records: &[Record]) -> std::collections::BTreeMap<i64, Vec<String>> {
+    let mut by_driver: std::collections::BTreeMap<i64, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        let Value::Integer(key) = record.values()[0] else {
+            panic!("driver key is an int: {record:?}");
+        };
+        let Value::String(name) = &record.values()[3] else {
+            panic!("build name is a string: {record:?}");
+        };
+        by_driver.entry(key).or_default().push(name.to_string());
+    }
+    by_driver
+}
+
+/// Grace-hash takes each key's build rows in arrival order: resident, `first`
+/// picks the earliest and `all` emits them in arrival order; spilled, `all`
+/// still emits them in arrival order.
+///
+/// The spilled run's budget keeps spilling at reload, so every partition
+/// reloads through the block-nested-loop fallback, which decides `first`
+/// once per build chunk rather than once per driver. That fallback's
+/// per-chunk decisions are a separate defect, so the spilled run asserts
+/// only `all`.
+#[test]
+fn grace_hash_candidates_follow_build_arrival_order_resident_and_spilled() {
+    use clinker_plan::config::pipeline_node::MatchMode;
+    let expected = |key: i64| -> Vec<String> {
+        (0..GRACE_ORDER_PER_KEY)
+            .map(|n| format!("b-{key}-{n}"))
+            .collect()
+    };
+    let resident =
+        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+    let first = grace_pairs_by_driver(&run_grace_arrival_order(MatchMode::First, &resident));
+    let all = grace_pairs_by_driver(&run_grace_arrival_order(MatchMode::All, &resident));
+    assert_eq!(first.len(), GRACE_ORDER_KEYS as usize, "every driver");
+    for key in 0..GRACE_ORDER_KEYS {
+        assert_eq!(
+            first[&key],
+            [format!("b-{key}-0")],
+            "resident: first picks key {key}'s earliest build row"
+        );
+        assert_eq!(
+            all[&key],
+            expected(key),
+            "resident: all emits key {key}'s build rows in arrival order"
+        );
+    }
+
+    let spilled = grace_pairs_by_driver(&run_grace_arrival_order(MatchMode::All, &tiny_budget()));
+    for key in 0..GRACE_ORDER_KEYS {
+        assert_eq!(
+            spilled[&key],
+            expected(key),
+            "spilled: all emits key {key}'s build rows in arrival order"
+        );
     }
 }

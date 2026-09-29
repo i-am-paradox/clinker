@@ -105,6 +105,12 @@ This is a runtime routing decision on the data, distinct from the plan-time `E31
 
 Emit one output row per driver record, using the first matching build-side record. Standard 1:1 enrichment. Default.
 
+"First" means the earliest in the build input's arrival order: of the build records that match a driver, the one the build input delivered first. The same order sets the row order of [`match: all`](#match-all) within a driver and the element order of a [`match: collect`](#match-collect) array. It holds identically for every join strategy the planner may pick and whatever shape the `where:` predicate has. One exception remains. When the build input exceeds the memory limit, the Combine sets part of it aside on disk and splits that part into smaller pieces until each fits. If a piece still does not fit after splitting, the Combine processes it in chunks and currently decides `first`, `collect` and `on_miss` once per chunk rather than once per driver, so a driver can receive more than one `first` row or more than one `collect` row. A piece fails to fit in three cases: the build rows sharing one key value do not fit on their own; the build input has already been split into the maximum of 4,096 pieces; or splitting a piece again leaves most of its rows together, as happens when many rows share a key value or their key values happen to land in the same piece. So the exception can reach a driver even when no single key value is over the limit, for example with a large build input under a tight memory limit. This is a known defect.
+
+- **To pick a different record, order the build input upstream.** For example, to enrich each driver with the *latest* price, deliver the build input sorted descending on its date, such as with a descending [`sort_order`](source.md) on the build Source. A Combine has no ordering option of its own.
+- **A correlation key orders its Source.** Declaring `correlation_key` on the build Source makes the planner sort that Source's rows by the key before they reach the Combine, unless its declared `sort_order` already begins with the key. That order is what "first" follows. See [Correlation keys](../pipelines/correlation-keys.md#row-order).
+- **An unseeded `interleave` Merge has no fixed order.** When the build input is such a Merge, its cross-input order follows arrival at run time, so "first" follows that unfixed order too. Use `concat`, or a seeded `interleave`, for a build input whose order must be the same on every run.
+
 ```yaml
   config:
     where: "orders.product_id == products.product_id"
@@ -120,7 +126,7 @@ The `where:` predicate selects the match; the `cxl:` body is a **post-match proj
 
 ### `match: all`
 
-Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted.
+Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted, in the build input's arrival order (see [`match: first`](#match-first)).
 
 ```yaml
   config:
@@ -133,7 +139,7 @@ Emit one output row for every matching build-side record. 1:N fan-out -- if a dr
 
 ### `match: collect`
 
-Gather every matching build-side record into a single Array-typed field on the output row. The driver record appears once; the build matches are aggregated into an array. The `cxl:` body must be empty under `collect` -- the combine node synthesizes the output as `{ driver fields..., <build_qualifier>: Array }`.
+Gather every matching build-side record into a single Array-typed field on the output row. The driver record appears once; the build matches are aggregated into an array, in the build input's arrival order (see [`match: first`](#match-first)). The `cxl:` body must be empty under `collect` -- the combine node synthesizes the output as `{ driver fields..., <build_qualifier>: Array }`.
 
 ```yaml
   config:
