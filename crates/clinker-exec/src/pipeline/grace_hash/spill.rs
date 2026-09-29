@@ -332,9 +332,10 @@ pub(super) fn process_spilled_partition(
 
     // Build the in-memory hash table for the reloaded partition. The table
     // keeps insertion order, so `build_rows` aligns with its candidate
-    // indices.
-    let (build_records, build_rows): (Vec<Record>, Vec<RecordOrder>) =
-        build_records.into_iter().unzip();
+    // indices. It takes the records as it indexes them, so no second record
+    // vector is held while it builds.
+    let build_rows: Vec<RecordOrder> = build_records.iter().map(|(_, row)| *row).collect();
+    let build_records = build_records.into_iter().map(|(record, _)| record);
     let hash_table = CombineHashTable::build(
         build_records,
         build_extractor,
@@ -473,8 +474,10 @@ pub(super) fn bnl_fallback(
         stats.peak_chunk_records = stats.peak_chunk_records.max(chunk.len());
         let chunk_len = chunk.len();
         // The chunk's table keeps insertion order, so `chunk_rows` aligns
-        // with its candidate indices.
-        let (chunk, chunk_rows): (Vec<Record>, Vec<RecordOrder>) = chunk.into_iter().unzip();
+        // with its candidate indices, and takes the records as it indexes
+        // them.
+        let chunk_rows: Vec<RecordOrder> = chunk.iter().map(|(_, row)| *row).collect();
+        let chunk = chunk.into_iter().map(|(record, _)| record);
         let table =
             CombineHashTable::build(chunk, rc.build_extractor, rc.ctx, budget, Some(chunk_len))
                 .map_err(|e| PipelineError::MemoryBudgetExceeded {

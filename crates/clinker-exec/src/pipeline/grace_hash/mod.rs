@@ -542,9 +542,12 @@ impl GraceHashExecutor {
             let prev = std::mem::replace(&mut self.partitions[i], PartitionState::Done);
             let new_state = match prev {
                 PartitionState::Building { records, .. } => {
-                    let (records, build_rows): (Vec<Record>, Vec<RecordOrder>) =
-                        records.into_iter().unzip();
-                    if records.is_empty() {
+                    // The table takes the records as it indexes them, so
+                    // no second record vector is held while it builds.
+                    let build_rows: Vec<RecordOrder> =
+                        records.iter().map(|(_, row)| *row).collect();
+                    let records = records.into_iter().map(|(record, _)| record);
+                    if build_rows.is_empty() {
                         // Empty partition fast-path: still construct an
                         // empty hash table so probe lookups hit the
                         // Ready branch and emit zero matches uniformly.

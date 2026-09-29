@@ -710,6 +710,10 @@ impl CombineHashTable {
     ///   the rehash. When `None`, we fall back to `records.len()` —
     ///   always an upper bound on final table size.
     ///
+    /// `records` is consumed as it is indexed, so a caller that holds each
+    /// record beside other state can pass an iterator that moves the records
+    /// out without first collecting them into a second vector.
+    ///
     /// **Build records with NULL keys are indexed harmlessly:** they hash
     /// to the NULL sentinel and form chains alongside any collisions. They
     /// never match any probe because (a) the probe path short-circuits when
@@ -717,13 +721,18 @@ impl CombineHashTable {
     /// a non-null probe key, [`keys_equal_canonicalized`] rejects `Null` on
     /// both sides per SQL 3VL. Indexing them simplifies the build loop
     /// (no skip branch) and has no runtime cost beyond the chain slot.
-    pub fn build(
-        records: Vec<Record>,
+    pub fn build<I>(
+        records: I,
         extractor: &KeyExtractor,
         ctx: &EvalContext<'_>,
         budget: &MemoryArbitrator,
         estimated_rows: Option<usize>,
-    ) -> Result<Self, CombineError> {
+    ) -> Result<Self, CombineError>
+    where
+        I: IntoIterator<Item = Record>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let records = records.into_iter();
         let expected = estimated_rows.unwrap_or(records.len());
 
         // `u32::MAX` is reserved as SENTINEL. Refuse inputs that would
@@ -745,7 +754,7 @@ impl CombineHashTable {
         let mut arena: Vec<Record> = Vec::with_capacity(records.len());
         let hash_state = RandomState::new();
 
-        for (i, rec) in records.into_iter().enumerate() {
+        for (i, rec) in records.enumerate() {
             let keys = extractor
                 .extract(ctx, &rec)
                 .map_err(|e| CombineError::KeyEvalFailed {
