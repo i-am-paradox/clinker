@@ -1405,7 +1405,11 @@ fn emit_pairs(
         if let Some(residual) = evals.residual.as_mut() {
             let resolver =
                 CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
-            match residual.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+            match residual.eval_record::<NullStorage>(
+                &cfg.ctx.with_row(driver_order.ordinal()),
+                &resolver,
+                None,
+            ) {
                 Ok(EvalResult::Skip(_)) => continue,
                 Ok(EvalResult::Emit { .. }) => {}
                 Ok(EvalResult::EmitMany { .. }) => {
@@ -1500,7 +1504,11 @@ fn emit_match_row(
     if let Some(evaluator) = evals.body.as_mut() {
         let resolver =
             CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
-        match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+        match evaluator.eval_record::<NullStorage>(
+            &cfg.ctx.with_row(driver_order.ordinal()),
+            &resolver,
+            None,
+        ) {
             Ok(EvalResult::Emit {
                 fields,
                 record_vars,
@@ -1648,7 +1656,11 @@ fn dispatch_on_miss(
                 node: cfg.name.to_string(),
                 detail: "combine body typed program missing for on_miss: null_fields".to_string(),
             })?;
-            match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+            match evaluator.eval_record::<NullStorage>(
+                &cfg.ctx.with_row(driver_order.ordinal()),
+                &resolver,
+                None,
+            ) {
                 Ok(EvalResult::Emit {
                     fields,
                     record_vars,
