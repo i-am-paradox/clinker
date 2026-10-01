@@ -158,6 +158,7 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::RangeOp;
 
 use crate::executor::combine::CombineResolverMapping;
+use crate::pipeline::combine_verdict::{DriverVerdict, MissToken};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{HeapBytes, SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
@@ -641,7 +642,8 @@ pub(super) struct BlockBandExec<'a> {
     pub(super) build_qualifier: &'a str,
     pub(super) driver_records: Vec<(Record, RecordOrder)>,
     pub(super) driver_scans: Vec<RecordScan>,
-    pub(super) build_records: Vec<Record>,
+    /// Each build record with the row id its Source minted.
+    pub(super) build_records: Vec<(Record, RecordOrder)>,
     pub(super) build_scans: Vec<RecordScan>,
     pub(super) op1: RangeOp,
     pub(super) op2: Option<RangeOp>,
@@ -894,10 +896,10 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
         // copy of a spilled block (a resident block is already in the baseline
         // and only borrowed), the hoisted range-key column — `(k1, k2)` for a
         // two-conjunct band, the bare `k1` for the single-inequality PWMJ, with
-        // no dead second axis — and the `DriverRef` slice the emit consumes.
+        // no dead second axis — the `DriverRef` slice the emit consumes, and
+        // each driver's match-state scan slot.
         let driver_key_bytes = range_key_width(op2);
-        let driver_vecs_bytes =
-            (driver_block.len * (driver_key_bytes + std::mem::size_of::<DriverRef<'_>>())) as u64;
+        let driver_vecs_bytes = (driver_block.len * driver_slot_bytes(driver_key_bytes)) as u64;
         let driver_scratch = spilled_scratch_bytes(driver_block);
         let driver_held = driver_scratch.saturating_add(driver_vecs_bytes);
         // Gate the driver block's own load from metadata, symmetric with the
@@ -950,7 +952,11 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
         // this block. Each driver lands in exactly one driver block, so the
         // `First`-mode selection and the collect / on_miss finalization below
         // are globally correct even though the state is block-local.
-        let mut state = MatchState::new(driver_loaded.len(), emit_cfg.allocation_resources);
+        let mut state = MatchState::new(
+            driver_loaded.len(),
+            emit_cfg.match_mode,
+            emit_cfg.allocation_resources,
+        );
         let driver_slice: Vec<DriverRef<'_>> = driver_loaded
             .iter()
             .enumerate()
@@ -1016,7 +1022,8 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
             // pair's scratch for any spilled block loaded here (zero for a
             // borrowed resident block, already in the baseline), the build-side
             // vectors held across the kernel and emit (its range-key column
-            // sized per mode, the `build_idx` and `build_slice` vecs), the
+            // sized per mode, the `build_idx`, `build_row` and `build_slice`
+            // vecs), the
             // kernel's O(n) sort state (the two-conjunct IEJoin arrays or the
             // leaner PWMJ index vecs), the First / collect candidates held so far
             // in this driver block, and the in-block miss pile's CURRENT resident
@@ -1040,6 +1047,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
             let build_vecs_bytes = (build_block.len
                 * (range_key_width(op2)
                     + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<RecordOrder>()
                     + std::mem::size_of::<&Record>())) as u64;
             let aux_kernel = match op2 {
                 Some(_) => iejoin_numeric_state_bytes(driver_block.len, build_block.len),
@@ -1077,6 +1085,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                 continue;
             }
             let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.build_idx).collect();
+            let build_row: Vec<RecordOrder> = build_loaded.iter().map(|(_, p)| p.row).collect();
             charge_working_set(
                 consumer,
                 baseline_unaccounted,
@@ -1150,6 +1159,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                         driver_slice: &driver_slice,
                         build_slice: &build_slice,
                         build_idx: &build_idx,
+                        build_row: &build_row,
                     };
                     // Fixed working-set floor (everything but the live held bytes the
                     // collect poll adds), so a hot `match: collect` pair bounds its
@@ -1254,6 +1264,7 @@ fn execute_block_band_inner(exec: BlockBandExec<'_>) -> Result<BlockBandOutput, 
                             driver_slice: &driver_slice,
                             build_slice: &build_slice,
                             build_idx: &build_idx,
+                            build_row: &build_row,
                         };
                         emit_pairs(&emit_cfg, evals, &batch, state, sink, &pair_budget)
                     };
@@ -1477,12 +1488,18 @@ fn spilled_scratch_bytes<P>(block: &Block<P>) -> u64 {
 /// (canonical equality bytes, carried only for the per-pair re-verify) never
 /// participates in the order — keeping the `Ord`/`Eq` contract intact even
 /// though two distinct keys can share `eq_hash`.
+///
+/// `row` is the row id the build record's Source minted, which a build-side
+/// dead letter reports. It sits after the unique `build_idx`, so the derived
+/// order never reaches it either. It is inline, so the payload's
+/// `size_of`, and with it the sort, block and resident charge, includes it.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct BuildPayload {
     eq_hash: u64,
     k1: i128,
     k2: i128,
     build_idx: u64,
+    row: RecordOrder,
     eq: Vec<u8>,
 }
 
@@ -1625,12 +1642,12 @@ fn drain_driver_side(
 /// downstream First / Collect selection and the output ordering a pure function
 /// of the data. Unmatched builds are dropped (no build-side on_miss).
 fn drain_build_side(
-    build_records: Vec<Record>,
+    build_records: Vec<(Record, RecordOrder)>,
     build_scans: Vec<RecordScan>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
 ) -> Result<BuildBlocks, PipelineError> {
-    let Some(first) = build_records.first() else {
+    let Some((first, _)) = build_records.first() else {
         return Ok(Vec::new());
     };
     let schema = first.schema().clone();
@@ -1641,7 +1658,8 @@ fn drain_build_side(
         schema.clone(),
         ctx.allocation_resources.clone(),
     );
-    for (build_idx, (record, scan)) in build_records.into_iter().zip(build_scans).enumerate() {
+    for (build_idx, ((record, row), scan)) in build_records.into_iter().zip(build_scans).enumerate()
+    {
         if let RecordScan::Matched {
             eq_hash,
             eq,
@@ -1656,6 +1674,7 @@ fn drain_build_side(
                     k1,
                     k2,
                     build_idx: build_idx as u64,
+                    row,
                     eq,
                 },
                 ctx,
@@ -1950,6 +1969,13 @@ fn spill_block<P: Serialize>(
     })
 }
 
+/// The fixed bytes a loaded driver block holds per driver beside its record:
+/// its range key column entry (`driver_key_bytes`), its [`DriverRef`], and
+/// its [`MatchState`] scan slot.
+fn driver_slot_bytes(driver_key_bytes: usize) -> usize {
+    driver_key_bytes + std::mem::size_of::<DriverRef<'_>>() + MatchState::SCAN_SLOT_BYTES
+}
+
 /// The deferred in-block-miss drain target handed to the driver-block finalizer:
 /// the spillable pile, the spill/charge context it drains through, and the
 /// `on_miss` policy that decides whether a miss is recorded at all. Bundled so
@@ -1960,14 +1986,16 @@ struct InblockPile<'a, 'ctx> {
     on_miss: OnMiss,
 }
 
-/// Finalize one driver block after its inner loop over build blocks. Under
-/// `Collect`, flush one row per driver (even zero-match drivers, with an empty
-/// array). Under `First`, emit each driver's held minimum-build-index candidate
-/// — the selection is a pure function of the data, not of the block layout —
-/// and gather any driver with no emitting candidate. Under `All`, gather every
-/// zero-match driver. Gathered drivers drain into the spillable in-block pile
-/// (keyed on `(driver_idx, order)`, charged against the disk quota, E320) for the
-/// deferred end-of-join on_miss dispatch, so on_miss:error names the
+/// Finalize one driver block after its inner loop over build blocks: each
+/// driver's [`DriverScan`] verdict decides what it writes. A `collect` driver
+/// with no failed candidate flushes one row (with an empty array when nothing
+/// matched); one with a failed candidate writes nothing more, its failures
+/// already written. A `first` driver runs the body on its held earliest true
+/// candidate — the selection is a pure function of the data, not of the block
+/// layout — or writes its held earliest failure. A driver with no true and no
+/// failed candidate is a miss and drains into the spillable in-block pile
+/// (keyed on `(driver_idx, order)`, charged against the disk quota, E320) for
+/// the deferred end-of-join on_miss dispatch, so on_miss:error names the
 /// lowest-input-index unmatched driver rather than whichever block finalized
 /// first and the pile stays bounded rather than resident. Each driver's global
 /// input index (`payload.driver_idx`) is carried through so its rows tag
@@ -1980,42 +2008,35 @@ fn finalize_driver_block(
     pile: &mut InblockPile<'_, '_>,
     sink: &mut EmitSink<'_>,
 ) -> Result<(), PipelineError> {
-    match cfg.match_mode {
-        MatchMode::Collect => {
-            for (di, (record, payload)) in driver_loaded.iter().enumerate() {
+    for (di, (record, payload)) in driver_loaded.iter().enumerate() {
+        match state.finish(di, cfg.match_mode, cfg.name)? {
+            DriverVerdict::Collected => {
                 let flush = state.take_collect(di);
                 flush_collect_row(cfg, record, payload.order, payload.driver_idx, flush, sink)?;
             }
-        }
-        MatchMode::First => {
-            for (di, (record, payload)) in driver_loaded.iter().enumerate() {
-                match state.take_first_candidate(di) {
-                    // A held candidate means this driver matched the predicate:
-                    // its minimum-build-index match is the selection and the
-                    // body is a post-match projection. Run it once and discard
-                    // the emit/skip result — a body skip drops only this output
-                    // row, it does not turn a matched driver into a miss.
-                    Some((bidx, build)) => {
-                        let dref = DriverRef {
-                            record,
-                            order: payload.order,
-                            key: di,
-                            driver_idx: payload.driver_idx,
-                        };
-                        emit_match_row(cfg, evals, &dref, &build, bidx, sink)?;
-                    }
-                    // No candidate held: the driver matched no build predicate,
-                    // a genuine zero-match routed to the deferred on_miss
-                    // dispatch.
-                    None => note_unmatched(pile, record, payload.order, payload.driver_idx)?,
-                }
+            DriverVerdict::CollectFailed => drop(state.take_collect(di)),
+            // The earliest true candidate is the selection and the body is a
+            // post-match projection. Run it once and discard the emit/skip
+            // result: a body skip drops only this output row, it does not turn
+            // a matched driver into a miss.
+            DriverVerdict::Selected((bidx, build, build_row)) => {
+                let dref = DriverRef {
+                    record,
+                    order: payload.order,
+                    key: di,
+                    driver_idx: payload.driver_idx,
+                };
+                emit_match_row(cfg, evals, &dref, &build, bidx, build_row, sink)?;
             }
-        }
-        MatchMode::All => {
-            for (di, (record, payload)) in driver_loaded.iter().enumerate() {
-                if !state.matched[di] {
-                    note_unmatched(pile, record, payload.order, payload.driver_idx)?;
+            DriverVerdict::FailedFirst(tagged) => {
+                if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
+                    return Err(PipelineError::from(tagged.failure.error));
                 }
+                tagged.push_to(sink);
+            }
+            DriverVerdict::Pairs => {}
+            DriverVerdict::Miss(miss) => {
+                note_unmatched(pile, record, payload.order, payload.driver_idx, miss)?;
             }
         }
     }
@@ -2111,12 +2132,36 @@ fn dispatch_deferred_misses(
         };
         if take_scan {
             if let Some((record, (driver_idx, order))) = scan_cur {
-                dispatch_on_miss(cfg, evals, &record, order, driver_idx, on_miss, sink)?;
+                // Every pile entry was recorded with its miss proof: a
+                // scan-phase driver whose keys admit no candidate, or an
+                // in-block driver whose scan found none.
+                dispatch_on_miss(
+                    cfg,
+                    evals,
+                    &record,
+                    order,
+                    driver_idx,
+                    on_miss,
+                    MissToken::no_candidates(),
+                    sink,
+                )?;
             }
             scan_cur = scan_stream.next().transpose()?;
         } else {
             if let Some((record, (driver_idx, order))) = inblock_cur {
-                dispatch_on_miss(cfg, evals, &record, order, driver_idx, on_miss, sink)?;
+                // Every pile entry was recorded with its miss proof: a
+                // scan-phase driver whose keys admit no candidate, or an
+                // in-block driver whose scan found none.
+                dispatch_on_miss(
+                    cfg,
+                    evals,
+                    &record,
+                    order,
+                    driver_idx,
+                    on_miss,
+                    MissToken::no_candidates(),
+                    sink,
+                )?;
             }
             inblock_cur = inblock_stream.next().transpose()?;
         }
@@ -2178,6 +2223,7 @@ fn note_unmatched(
     record: &Record,
     order: RecordOrder,
     driver_idx: u64,
+    _miss: MissToken,
 ) -> Result<(), PipelineError> {
     if !matches!(pile.on_miss, OnMiss::Skip) {
         push_charge_spill(pile.buf, record.clone(), (driver_idx, order), pile.ctx)?;
@@ -2287,6 +2333,7 @@ mod tests {
             k1: 0,
             k2: 0,
             build_idx: 0,
+            row: RecordOrder::from(0),
             eq: Vec::new(),
         }
     }
@@ -2516,7 +2563,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: cfg.op1,
             op2: cfg.op2,
@@ -3618,9 +3665,10 @@ mod tests {
                 match_mode: mode,
                 on_miss: OnMiss::Skip,
                 // One block per side, so the surviving pair is a single dense
-                // cross-product the tight budget cannot materialize whole.
+                // cross-product the tight budget cannot materialize whole. The
+                // limit leaves room for the block's per-driver state and no more.
                 block_target: 1 << 20,
-                hard_limit: 128 * 1024,
+                hard_limit: 134 * 1024,
                 max_spill_bytes: None,
                 sort_spill: None,
                 resident_budget: None,
@@ -3742,7 +3790,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: cfg.op1,
             op2: cfg.op2,
@@ -4060,7 +4108,7 @@ mod tests {
                 build_qualifier: "b",
                 driver_records,
                 driver_scans,
-                build_records,
+                build_records: crate::test_support::with_build_row_ids(build_records),
                 build_scans,
                 op1: RangeOp::Le,
                 op2: Some(RangeOp::Ge),
@@ -4159,7 +4207,7 @@ mod tests {
                 build_qualifier: "b",
                 driver_records,
                 driver_scans,
-                build_records,
+                build_records: crate::test_support::with_build_row_ids(build_records),
                 build_scans,
                 op1: RangeOp::Le,
                 op2: Some(RangeOp::Ge),
@@ -4282,7 +4330,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
@@ -4538,7 +4586,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
@@ -4776,7 +4824,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
@@ -4945,11 +4993,12 @@ mod tests {
                 .iter()
                 .map(|r| pair_bytes(r, &build_payload_probe()) as u64)
                 .sum::<u64>();
-        let driver_vecs =
-            (driver.len() * (range_key_width(op2) + std::mem::size_of::<DriverRef<'_>>())) as u64;
+        let driver_vecs = (driver.len() * driver_slot_bytes(range_key_width(op2))) as u64;
         let build_vecs = (build.len()
-            * (range_key_width(op2) + std::mem::size_of::<u64>() + std::mem::size_of::<&Record>()))
-            as u64;
+            * (range_key_width(op2)
+                + std::mem::size_of::<u64>()
+                + std::mem::size_of::<RecordOrder>()
+                + std::mem::size_of::<&Record>())) as u64;
         let aux = iejoin_numeric_state_bytes(driver.len(), build.len()) as u64;
         let pairs_bytes =
             (driver.len() * build.len() * std::mem::size_of::<(usize, usize)>()) as u64;
@@ -5050,8 +5099,7 @@ mod tests {
         let r_d = pair_bytes(&driver_records[0], &driver_payload_probe()) as u64;
         let block_target = (RECORDS_PER_BLOCK * r_d) as usize;
         let block_bytes = RECORDS_PER_BLOCK * r_d;
-        let driver_vecs = RECORDS_PER_BLOCK
-            * (range_key_width(op2) as u64 + std::mem::size_of::<DriverRef<'_>>() as u64);
+        let driver_vecs = RECORDS_PER_BLOCK * driver_slot_bytes(range_key_width(op2)) as u64;
         let driver_held = block_bytes + driver_vecs;
         // `s` is the co-resident input footprint the gate measures for a full,
         // spilled driver block: the resident baseline plus that block's held bytes.
@@ -5240,7 +5288,7 @@ mod tests {
             build_qualifier: "b",
             driver_records,
             driver_scans,
-            build_records,
+            build_records: crate::test_support::with_build_row_ids(build_records),
             build_scans,
             op1: cfg.op1,
             op2: cfg.op2,
@@ -5774,6 +5822,7 @@ mod tests {
             k1: 1,
             k2: 2,
             build_idx: 0,
+            row: RecordOrder::from(0),
             eq: vec![1, 2, 3],
         };
         let budget = MemoryArbitrator::with_policy(
@@ -5949,6 +5998,7 @@ mod tests {
                 k1: k as i128,
                 k2: 0,
                 build_idx: k as u64,
+                row: RecordOrder::from(k as u64),
                 eq: vec![],
             };
             one_block = pair_bytes(&record, &payload) as u64;

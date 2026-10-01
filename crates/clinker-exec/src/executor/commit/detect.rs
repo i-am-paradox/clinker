@@ -131,9 +131,10 @@ pub(crate) fn detect_retract_scope(
             continue;
         };
         // Probe the cell's schema for engine-stamped column lineage.
-        // Every CorrelationErrorRecord in a given cell shares the same
-        // schema (cells are keyed by the engine-stamped tuple), so the
-        // first error_message is representative.
+        // Every held failure's trigger record in a given cell shares the
+        // same schema (cells are keyed by the engine-stamped tuple), so the
+        // first is representative. A failure's contributing build row may
+        // come from another source with another schema and is never probed.
         let schema = group
             .error_messages
             .first()
@@ -239,6 +240,8 @@ pub(crate) fn detect_retract_scope(
         // entries here would feed aggregate-output row numbers into
         // `retract_row` and exercise the not-found tolerance, silently
         // no-opping. Skip the raw union in that case.
+        // Only the failing rows are retracted. A failure's contributing
+        // build row did not fail, so its contributions stay.
         if has_source_ck || !had_synthetic_lookup {
             for err in &group.error_messages {
                 affected_rows.insert(err.row_num);

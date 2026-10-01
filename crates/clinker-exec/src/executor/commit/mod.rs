@@ -64,9 +64,9 @@ use std::collections::HashMap;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CommitStepPath, CorrelationErrorRecord, CorrelationGroupBuffer, ExecutorContext,
-    commit_correlation_buffers,
+    CommitStepPath, CorrelationGroupBuffer, ExecutorContext, commit_correlation_buffers,
 };
+use crate::executor::held_failure::union_held_failures;
 use clinker_plan::config::CorrelationFanoutPolicy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::ExecutionPlanDag;
@@ -249,9 +249,10 @@ fn close_converged_transform_signals(ctx: &mut ExecutorContext<'_>) {
 }
 
 /// Capture every error_messages / error_rows entry from the live
-/// correlation buffer into the cross-iteration archive, deduplicating
-/// against entries already there (by `(key, row_num)` so the same
-/// failure observed across iterations counts once). Records are NOT
+/// correlation buffer into the cross-iteration archive, per cell, through
+/// [`union_held_failures`]: a failure observed again on a later iteration,
+/// under fresh stamps, is archived once, while every distinct failure (two
+/// failures of one driver against two build rows included) is kept. Records are NOT
 /// archived — they are speculative per-iteration writes that
 /// `restore_baseline` discards.
 fn archive_iteration_errors(
@@ -264,23 +265,10 @@ fn archive_iteration_errors(
             continue;
         }
         let entry = archive.entry(key.clone()).or_default();
-        for err in &group.error_messages {
-            let already = entry
-                .error_messages
-                .iter()
-                .any(|e| e.row_num == err.row_num && e.error_message == err.error_message);
-            if !already {
-                entry.error_messages.push(CorrelationErrorRecord {
-                    row_num: err.row_num,
-                    original_record: err.original_record.clone(),
-                    category: err.category,
-                    error_message: err.error_message.clone(),
-                    stage: err.stage.clone(),
-                    route: err.route.clone(),
-                    failed_at: err.failed_at,
-                });
-            }
-        }
+        union_held_failures(
+            &mut entry.error_messages,
+            group.error_messages.iter().cloned(),
+        );
         for &row in &group.error_rows {
             entry.error_rows.insert(row);
         }
@@ -300,15 +288,7 @@ fn merge_archive_into_live(
     };
     for (key, archived) in archive {
         let entry = live_map.entry(key).or_default();
-        for err in archived.error_messages {
-            let already = entry
-                .error_messages
-                .iter()
-                .any(|e| e.row_num == err.row_num && e.error_message == err.error_message);
-            if !already {
-                entry.error_messages.push(err);
-            }
-        }
+        union_held_failures(&mut entry.error_messages, archived.error_messages);
         for row in archived.error_rows {
             entry.error_rows.insert(row);
         }

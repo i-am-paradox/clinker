@@ -17,6 +17,7 @@ mod dlq;
 pub(crate) mod document_dlq;
 pub(crate) mod envelope;
 pub(crate) mod envelope_dispatch;
+pub(crate) mod held_failure;
 mod ingest;
 pub(crate) mod invariant;
 pub(crate) mod merge_dispatch;
@@ -2950,6 +2951,7 @@ nodes:
 
     mod aggregation;
     mod combine_consumer_lifecycle;
+    mod combine_kernel_dead_letters;
     mod composition_port_admission_overshoot;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;

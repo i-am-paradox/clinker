@@ -17,9 +17,10 @@ use std::sync::Arc;
 use clinker_record::GroupByKey;
 
 use crate::executor::dispatch::{
-    CorrelationErrorRecord, CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext,
-    MERGED_SOURCE_NAME, push_dlq, push_write_error, source_name_arc_of,
+    CorrelationGroupBuffer, CorrelationRecordSlot, ExecutorContext, MERGED_SOURCE_NAME, push_dlq,
+    push_write_error, source_name_arc_of,
 };
+use crate::executor::held_failure::{HeldFailure, write_failure};
 use crate::executor::preparation::is_explicit_cancellation;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{
@@ -116,8 +117,17 @@ fn commit_one_group(
         );
     }
 
-    let group_dirty = !error_rows.is_empty();
-    if !group_dirty {
+    // A group is dirty when it holds at least one failure. A failure's
+    // contributing build row is part of that failure and never makes a
+    // group dirty by itself.
+    let Some(first_err) = error_messages.first() else {
+        if !error_rows.is_empty() {
+            return Err(PipelineError::Internal {
+                op: "correlation-commit",
+                node: format_group_key(group_key),
+                detail: "a correlation group records failing rows but holds no failure".to_string(),
+            });
+        }
         // Clean group → drop the records into the per-output queue
         // for batched flush after every group has been visited.
         for slot in records {
@@ -127,22 +137,15 @@ fn commit_one_group(
                 .push(slot);
         }
         return Ok(());
-    }
-
-    // Dirty group → drop projected records, emit DLQ entries for every
-    // distinct row_num touched by the group. Triggers come from
-    // `error_messages`; collaterals come from `records` (rows that
-    // succeeded their leg but get rolled back because the group failed).
-    // The group's first parked error is the failure its collaterals are
-    // attributed to: their detail quotes its message, and their trigger id
-    // is its trigger row's id. `group_dirty` guarantees it exists.
-    let Some(first_err) = error_messages.first() else {
-        return Err(PipelineError::Internal {
-            op: "correlation-commit",
-            node: format_group_key(group_key),
-            detail: "a dirty correlation group holds no parked error".to_string(),
-        });
     };
+
+    // Dirty group → drop projected records and write the DLQ: every held
+    // failure, one trigger row per failure with its contributing build row,
+    // then each distinct row of `records` (rows that succeeded their leg but
+    // get rolled back because the group failed) not already written. The
+    // group's first failure is the one its `records` collaterals are
+    // attributed to: their detail quotes its message, and their trigger id
+    // is its trigger row's id.
     let first_err_message = first_err.error_message.clone();
     let first_err_stamp = first_err.failed_at;
 
@@ -157,6 +160,8 @@ fn commit_one_group(
     // single-source pipeline by construction: every co-grouped slot
     // shares the failing source, so the wider behavior is
     // bit-identical to today's pipeline-wide collateral DLQ.
+    // Only failing rows count: a contributing build row's source had no
+    // causal role in the group's failure.
     let failing_sources: HashSet<Arc<str>> = error_messages
         .iter()
         .map(|err| source_name_arc_of(&err.original_record))
@@ -166,7 +171,19 @@ fn commit_one_group(
     // directly so Route fan-out emits one entry per source row without
     // reconstructing identity from a diagnostic source name.
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    write_held_failures(ctx, &error_messages, &mut seen_rows)?;
+    // Held failures, in parking order, one trigger row per failure, each
+    // followed by its contributing build row. A contributing build row did
+    // not fail, so it stays out of `seen_rows`: its own buffered slot in this
+    // group is spared or condemned below like any other row, and is only
+    // kept from a second dead letter once condemned.
+    let mut written_build_rows: HashSet<crate::executor::stream_event::SourceRowId> =
+        HashSet::new();
+    write_held_failures(
+        ctx,
+        &error_messages,
+        &mut seen_rows,
+        &mut written_build_rows,
+    )?;
     // Collateral entries: every other distinct row that flowed through
     // the group's Output buffers but didn't itself error. Two sparing
     // axes apply, in order:
@@ -223,7 +240,7 @@ fn commit_one_group(
                 .push(slot.clone());
             continue;
         }
-        if !seen_rows.insert(slot.row_num) {
+        if !seen_rows.insert(slot.row_num) || written_build_rows.contains(&slot.row_num) {
             continue;
         }
         push_dlq(
@@ -266,7 +283,7 @@ fn commit_overflowed_group(
     ctx: &mut ExecutorContext<'_>,
     group_key: &[GroupByKey],
     records: &[CorrelationRecordSlot],
-    error_messages: &[CorrelationErrorRecord],
+    error_messages: &[HeldFailure],
     held_entries: u64,
     overflow_stamp: DlqFailureStamp,
 ) -> Result<(), PipelineError> {
@@ -275,7 +292,12 @@ fn commit_overflowed_group(
     }
 
     let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
-    write_held_failures(ctx, error_messages, &mut seen_rows)?;
+    let mut written_build_rows: HashSet<crate::executor::stream_event::SourceRowId> =
+        HashSet::new();
+    write_held_failures(ctx, error_messages, &mut seen_rows, &mut written_build_rows)?;
+    // Overflow spares nothing, so a build row already written with its
+    // failure is not written again.
+    seen_rows.extend(written_build_rows);
 
     let overflow_msg = PipelineError::CorrelationGroupOverflow {
         group_key: format_group_key(group_key),
@@ -353,41 +375,30 @@ fn commit_overflowed_group(
     Ok(())
 }
 
-/// Write a group's held failures in parking order, one row per source row
-/// (the first failure parked for a row wins), recording each written row in
-/// `seen_rows`.
+/// Write a group's held failures in parking order, recording each written
+/// trigger row in `seen_rows` and each written contributing build row in
+/// `build_rows`. The two are kept apart because a build row did not fail:
+/// the dirty commit still decides whether its own buffered slot is spared.
 ///
-/// Each row keeps the failure's own category, message, stage, route and
-/// stamp. A held failure is a trigger unless its stamp pairs it with another
-/// failure's trigger (a second row of that failure), in which case it keeps
-/// that trigger's id and is written as collateral. The dirty and the
-/// overflowed commit both write held failures here, so the two cannot
-/// diverge.
+/// Every held failure writes one trigger row, with its own category,
+/// message, stage, route, triggering field and value, and stamp, and then
+/// its contributing build row, exactly as the failure is written without a
+/// correlation key ([`HeldFailure::into_entries`]). A row that failed twice,
+/// on two fan-out branches or against two build rows, is written once per
+/// failure. The dirty and the overflowed commit both write held failures
+/// here, so the two cannot diverge.
 fn write_held_failures(
     ctx: &mut ExecutorContext<'_>,
-    error_messages: &[CorrelationErrorRecord],
+    error_messages: &[HeldFailure],
     seen_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
+    build_rows: &mut HashSet<crate::executor::stream_event::SourceRowId>,
 ) -> Result<(), PipelineError> {
-    for err in error_messages {
-        if !seen_rows.insert(err.row_num) {
-            continue;
+    for failure in error_messages {
+        seen_rows.insert(failure.row_num);
+        if let Some(build_row) = failure.contributing_build_row() {
+            build_rows.insert(build_row);
         }
-        push_dlq(
-            ctx,
-            DlqEntry {
-                source_row: err.row_num,
-                category: err.category,
-                error_message: err.error_message.clone(),
-                original_record: err.original_record.clone(),
-                stage: err.stage.clone(),
-                route: err.route.clone(),
-                trigger: err.failed_at.trigger_id() == err.failed_at.id(),
-                source_name: source_name_arc_of(&err.original_record),
-                triggering_field: None,
-                triggering_value: None,
-                failed_at: err.failed_at,
-            },
-        )?;
+        write_failure(ctx, failure.clone())?;
     }
     Ok(())
 }

@@ -88,6 +88,32 @@ pub(crate) fn single_csv_document_metadata_bytes(
     bytes as u64
 }
 
+/// Pair each build fixture record with the row id its Source would mint:
+/// ordinal `index + 1` under Source node 1.
+///
+/// Build fixtures take a Source node other than node 0, which driver fixtures
+/// use through the test-only `From<u64>` for `SourceRowId`. A kernel test
+/// that confused a build row's identity with a driver's would therefore see a
+/// different Source, not just a different ordinal.
+pub(crate) fn with_build_row_ids(
+    records: Vec<clinker_record::Record>,
+) -> Vec<(
+    clinker_record::Record,
+    crate::executor::stream_event::SourceRowId,
+)> {
+    let source = <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(1);
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            (
+                record,
+                crate::executor::stream_event::SourceRowId::new(source, index as u64 + 1),
+            )
+        })
+        .collect()
+}
+
 /// Eagerly decode single-file CSV fixtures before execution, using the compiled
 /// source body's parser, schema and coercion policy. The returned sources own
 /// already-materialized external records; no decoder runs under the test's
@@ -572,5 +598,63 @@ impl CapturedDlqRow {
             .expect("every dead-letter header carries _cxl_dlq_source_row");
         cell.parse()
             .unwrap_or_else(|_| panic!("_cxl_dlq_source_row must be an ordinal; got {cell:?}"))
+    }
+
+    /// The header and the cells, with the cell of each column named in
+    /// `columns` replaced by a fixed token.
+    ///
+    /// For byte-identity comparisons that ignore generated columns: the
+    /// encoder writes a row as a pure function of its header and cells, so
+    /// two runs whose masked rows are equal wrote the same bytes outside the
+    /// masked columns. A name the header lacks masks nothing.
+    pub(crate) fn masked(&self, columns: &[&str]) -> (Vec<String>, Vec<String>) {
+        const MASK: &str = "<masked>";
+        let cells = self
+            .header
+            .iter()
+            .zip(&self.cells)
+            .map(|(name, cell)| {
+                if columns.contains(&name.as_str()) {
+                    MASK.to_owned()
+                } else {
+                    cell.clone()
+                }
+            })
+            .collect();
+        (self.header.to_vec(), cells)
+    }
+}
+
+/// Assert that every row's `_cxl_dlq_trigger_id` names a trigger row the run
+/// wrote: a row, in any bucket, whose `_cxl_dlq_id` equals it and whose
+/// `_cxl_dlq_trigger` is true. A trigger names itself.
+pub(crate) fn assert_pairing_integrity(rows: &[CapturedDlqRow]) {
+    let cell = |row: &CapturedDlqRow, column: &str| -> String {
+        row.field(column)
+            .unwrap_or_else(|| panic!("every dead-letter header carries {column}"))
+            .to_owned()
+    };
+    let triggers: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|row| row.trigger())
+        .map(|row| cell(row, "_cxl_dlq_id"))
+        .collect();
+    for (n, row) in rows.iter().enumerate() {
+        let trigger_id = cell(row, "_cxl_dlq_trigger_id");
+        if row.trigger() {
+            assert_eq!(
+                trigger_id,
+                cell(row, "_cxl_dlq_id"),
+                "row {n}: a trigger row names itself"
+            );
+        } else {
+            assert!(
+                triggers.contains(&trigger_id),
+                "row {n} (row {}, {:?}) names trigger {trigger_id}, which no written trigger \
+                 row carries",
+                row.source_row(),
+                row.category()
+            );
+        }
     }
 }

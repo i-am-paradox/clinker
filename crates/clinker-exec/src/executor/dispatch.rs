@@ -1033,53 +1033,6 @@ pub(crate) fn buffer_key_for_record(
     key
 }
 
-/// Redirect a per-record error into the correlation buffer when
-/// correlation buffering is active.
-///
-/// Returns `true` iff the buffer is active and the error has been
-/// parked under the record's group cell — the caller must NOT also
-/// call [`push_dlq`] for it. Returns `false`
-/// when the buffer is unconfigured, signaling the caller to take the
-/// per-record DLQ path. Buffer admission counts one held entry,
-/// stamping the group's overflow once `max_group_buffer` is exceeded.
-/// Null-keyed records get a row-number-disambiguated cell so each is
-/// its own group of one. `failed_at` is the stamp the caller took when it
-/// observed the failure; the parked error keeps it until the group commits.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_error_to_buffer_if_grouped(
-    ctx: &mut ExecutorContext<'_>,
-    record: &Record,
-    row_num: crate::executor::stream_event::SourceRowId,
-    category: clinker_core_types::dlq::DlqErrorCategory,
-    error_message: String,
-    stage: Option<String>,
-    route: Option<String>,
-    failed_at: DlqFailureStamp,
-) -> bool {
-    if ctx.correlation_buffers.is_none() {
-        return false;
-    }
-    let key = buffer_key_for_record(record, row_num);
-    let max_buf = ctx.correlation_max_group_buffer;
-    let buffers = ctx
-        .correlation_buffers
-        .as_mut()
-        .expect("checked buffers Some above");
-    let entry = buffers.entry(key).or_default();
-    entry.admit_entry(max_buf);
-    entry.error_rows.insert(row_num);
-    entry.error_messages.push(CorrelationErrorRecord {
-        row_num,
-        original_record: record.clone(),
-        category,
-        error_message,
-        stage,
-        route,
-        failed_at,
-    });
-    true
-}
-
 /// Dispatch a Transform CXL evaluation failure through the shared
 /// error path used by every Transform call site.
 ///
@@ -1112,59 +1065,40 @@ pub(crate) fn dispatch_transform_eval_error(
         }
         _ => clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
     };
-    let failed_at = DlqFailureStamp::now();
-    let stage = Some(DlqEntry::stage_transform(&transform_name));
-    let routed = record_error_to_buffer_if_grouped(
-        ctx,
-        &record,
+    let failure = crate::executor::held_failure::HeldFailure::new(
         row_num,
+        record,
         category,
         eval_err.to_string(),
-        stage.clone(),
+        Some(DlqEntry::stage_transform(&transform_name)),
         None,
-        failed_at,
+        eval_err.triggering_field.clone(),
+        eval_err.triggering_value(),
+        DlqFailureStamp::now(),
     );
-    if routed {
+    let Some(failure) = crate::executor::held_failure::hold_failure_if_grouped(ctx, failure) else {
         return Ok(());
-    }
-    let triggering_field = eval_err.triggering_field.clone();
-    let triggering_value = eval_err.triggering_value();
+    };
     // Under `dlq_granularity: document`, a failure here condemns the whole
     // document: mark it failed (capturing this record as the root cause)
     // instead of dead-lettering only the failing record. The Output arm
     // emits the trigger + collateral entries at the document's close.
     let marked = crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
         ctx,
-        &record,
-        row_num,
-        category,
-        eval_err.to_string(),
-        stage.clone(),
+        &failure.original_record,
+        failure.row_num,
+        failure.category,
+        failure.error_message.clone(),
+        failure.stage.clone(),
         None,
-        triggering_field.clone(),
-        triggering_value.clone(),
-        failed_at,
+        failure.triggering_field.clone(),
+        failure.triggering_value.clone(),
+        failure.failed_at,
     );
     if marked {
         return Ok(());
     }
-    let source_name = source_name_arc_of(&record);
-    push_dlq(
-        ctx,
-        DlqEntry {
-            source_row: row_num,
-            category,
-            error_message: eval_err.to_string(),
-            original_record: record,
-            stage,
-            route: None,
-            trigger: true,
-            source_name,
-            triggering_field,
-            triggering_value,
-            failed_at,
-        },
-    )
+    crate::executor::held_failure::write_failure(ctx, failure)
 }
 
 /// Record a sink write/flush failure in `output_errors` instead of
@@ -5095,7 +5029,7 @@ pub(crate) fn dispatch_plan_node(
 /// output rows captured by the Sink arm before any writer commit, one per
 /// Sink a row reaches; `error_rows` carries the source-row IDs of records
 /// that failed somewhere in the pipeline, and `error_messages` holds each
-/// parked failure in parking order for the trigger entries.
+/// held failure ([`crate::executor::held_failure::HeldFailure`]) in parking order.
 ///
 /// `held_entries` counts held entries, not distinct source rows: every
 /// Sink slot and every parked failure is one entry, so a row an inclusive
@@ -5115,7 +5049,7 @@ pub(crate) fn dispatch_plan_node(
 pub(crate) struct CorrelationGroupBuffer {
     pub(crate) records: Vec<CorrelationRecordSlot>,
     pub(crate) error_rows: HashSet<crate::executor::stream_event::SourceRowId>,
-    pub(crate) error_messages: Vec<CorrelationErrorRecord>,
+    pub(crate) error_messages: Vec<crate::executor::held_failure::HeldFailure>,
     pub(crate) held_entries: u64,
     /// Taken when `held_entries` first passed `max_group_buffer`; `Some`
     /// exactly when the group has overflowed.
@@ -5170,27 +5104,6 @@ pub(crate) struct CorrelationRecordSlot {
     pub(crate) original_record: Record,
     pub(crate) projected: Record,
     pub(crate) output_name: String,
-}
-
-/// One failure event captured against a correlation group.
-///
-/// Pushed by the Transform / Route / Output arms when correlation
-/// buffering is active. `original_record` is the record at the moment
-/// of failure (e.g., the Transform input that failed evaluation).
-/// Multiple events per row are possible if a row fans out across
-/// branches and more than one branch fails — the `CorrelationCommit`
-/// arm dedupes by `row_num` for trigger emission.
-#[derive(Debug, Clone)]
-pub(crate) struct CorrelationErrorRecord {
-    pub(crate) row_num: crate::executor::stream_event::SourceRowId,
-    pub(crate) original_record: Record,
-    pub(crate) category: clinker_core_types::dlq::DlqErrorCategory,
-    pub(crate) error_message: String,
-    pub(crate) stage: Option<String>,
-    pub(crate) route: Option<String>,
-    /// Taken when the failure was observed; the trigger entry the commit
-    /// emits for this row carries it.
-    pub(crate) failed_at: DlqFailureStamp,
 }
 
 #[cfg(test)]

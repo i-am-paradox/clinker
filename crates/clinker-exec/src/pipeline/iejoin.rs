@@ -87,7 +87,13 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor, canonical_key_bytes};
+use crate::pipeline::combine::{
+    CombineOutputEvalFailure, KeyExtractor, MatchedBuildFailure, canonical_key_bytes,
+    held_record_bytes,
+};
+use crate::pipeline::combine_verdict::{
+    Admit, Decisive, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
+};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use clinker_plan::BudgetCategory;
@@ -535,7 +541,9 @@ pub(crate) struct IEJoinExec<'a> {
     pub name: &'a str,
     pub build_qualifier: &'a str,
     pub driver_records: Vec<(Record, RecordOrder)>,
-    pub build_records: Vec<Record>,
+    /// Each build record with the row id its Source minted, which a
+    /// build-side dead letter reports.
+    pub build_records: Vec<(Record, RecordOrder)>,
     pub decomposed: &'a DecomposedPredicate,
     pub body_program: Option<&'a Arc<TypedProgram>>,
     pub resolver_mapping: &'a CombineResolverMapping,
@@ -720,19 +728,21 @@ pub(crate) fn execute_combine_iejoin(
     let driver_range_extractor = KeyExtractor::new(driver_range_progs);
     let build_range_extractor = KeyExtractor::new(build_range_progs);
 
-    // Residual evaluator (for 3+ range conjuncts; the first two run
-    // through the IEJoin/PWMJ kernel and the rest re-check via the
-    // residual). The residual lives over the merged row, so it needs
-    // the full CombineResolver.
+    // Residual evaluator: the kernel verifies the first two range
+    // conjuncts, so the residual re-checks the predicate for every pair
+    // when there is a third range or a conjunct that is not a range at
+    // all. The residual lives over the merged row, so it needs the full
+    // CombineResolver.
     let n_ranges = range_ops.len();
-    let residual_eval: Option<ProgramEvaluator> = if n_ranges > 2 {
-        decomposed
-            .residual
-            .as_ref()
-            .map(|r| ProgramEvaluator::new(Arc::clone(r), false))
-    } else {
-        None
-    };
+    let residual_eval: Option<ProgramEvaluator> =
+        if n_ranges > 2 || decomposed.residual_exceeds_ranges() {
+            decomposed
+                .residual
+                .as_ref()
+                .map(|r| ProgramEvaluator::new(Arc::clone(r), false))
+        } else {
+            None
+        };
     let body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
 
     // Pre-scan: extract each record's canonical equality-key bytes and its range
@@ -773,7 +783,7 @@ pub(crate) fn execute_combine_iejoin(
 
     let build_scans: Vec<RecordScan> = build_records
         .par_iter()
-        .map(|rec| {
+        .map(|(rec, _)| {
             scan_record(
                 &build_extractor,
                 &build_range_extractor,
@@ -853,7 +863,8 @@ struct EmitConfig<'a> {
     strategy: clinker_plan::config::ErrorStrategy,
 }
 
-/// The residual (3+ range conjuncts) and body evaluators. Both are stateful
+/// The residual (a third range conjunct, or a conjunct that is not a range)
+/// and body evaluators. Both are stateful
 /// (`eval_record` takes `&mut self`), so they are owned here and borrowed
 /// mutably by the emit path.
 struct Evaluators {
@@ -880,14 +891,17 @@ struct DriverRef<'a> {
 }
 
 /// The per-call inputs to [`emit_pairs`]: the kernel's local pair indices, the
-/// driver and build slices they index, and each local build's original input
+/// driver and build slices they index, each local build's original input
 /// index, which drives the block-band's deterministic `First` selection,
-/// `Collect` ordering, and final output sort.
+/// `Collect` ordering, and final output sort, and each local build's row id,
+/// which a build-side dead letter reports. `build_idx` and `build_row` align
+/// with `build_slice`.
 struct EmitBatch<'a> {
     pairs: &'a [(usize, usize)],
     driver_slice: &'a [DriverRef<'a>],
     build_slice: &'a [&'a Record],
     build_idx: &'a [u64],
+    build_row: &'a [RecordOrder],
 }
 
 /// One accumulated collect-array element, ordered by a build-order key so a
@@ -931,11 +945,20 @@ fn collect_entry_cost(entry: &CollectEntry) -> u64 {
     (std::mem::size_of::<CollectEntry>() + entry.value.heap_size()) as u64
 }
 
-fn record_unaccounted_held_cost(
+/// Resident byte cost of one held build candidate: the cloned record plus the
+/// `R` held beside it (the build row id for a `First` candidate, nothing for
+/// the collect `$ck` build).
+fn candidate_held_cost<R>(record: &Record) -> u64 {
+    record_held_cost(record) + std::mem::size_of::<R>() as u64
+}
+
+/// [`candidate_held_cost`] net of the record heap the allocation resources
+/// already account for.
+fn candidate_unaccounted_held_cost<R>(
     record: &Record,
     resources: &clinker_record::owned_storage::AllocationResources,
 ) -> u64 {
-    (std::mem::size_of::<Record>() + record.unaccounted_heap_size(resources)) as u64
+    held_record_bytes(record, resources) + std::mem::size_of::<R>() as u64
 }
 fn collect_entry_unaccounted_cost(
     entry: &CollectEntry,
@@ -944,41 +967,105 @@ fn collect_entry_unaccounted_cost(
     (std::mem::size_of::<CollectEntry>() + entry.value.unaccounted_heap_size(resources)) as u64
 }
 
-/// Keep the `(idx, record)` with the smallest `idx` for `key` in `map`,
-/// adjusting `held_bytes` for whichever record is now resident. Shared by the
+/// Keep the `candidate` — a build's `(idx, record, row)` — with the smallest
+/// `idx` for `key` in `map`, adjusting `held_bytes` for whichever record and
+/// row id are now resident.
+/// Shared by the
 /// `First`-mode candidate and the collect `$ck` build so the min-selection rule
 /// (determinism-critical) lives in one place. A free function so the caller can
 /// pass two disjoint `MatchState` fields (`&mut self.first_match`,
 /// `&mut self.held_bytes`) without aliasing.
-fn keep_min(
+fn keep_min<R: Copy>(
     resources: &clinker_record::owned_storage::AllocationResources,
     unaccounted_bytes: &mut u64,
-    map: &mut HashMap<usize, (u64, Record)>,
+    map: &mut HashMap<usize, (u64, Record, R)>,
     held_bytes: &mut u64,
     key: usize,
-    idx: u64,
-    record: &Record,
+    candidate: (u64, &Record, R),
 ) {
+    let (idx, record, row) = candidate;
     match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut e) if idx < e.get().0 => {
             let cloned = record.clone();
-            *held_bytes = held_bytes.saturating_sub(record_held_cost(&e.get().1));
-            *held_bytes = held_bytes.saturating_add(record_held_cost(&cloned));
+            *held_bytes = held_bytes.saturating_sub(candidate_held_cost::<R>(&e.get().1));
+            *held_bytes = held_bytes.saturating_add(candidate_held_cost::<R>(&cloned));
             *unaccounted_bytes = unaccounted_bytes
-                .saturating_sub(record_unaccounted_held_cost(&e.get().1, resources));
-            *unaccounted_bytes =
-                unaccounted_bytes.saturating_add(record_unaccounted_held_cost(&cloned, resources));
-            e.insert((idx, cloned));
+                .saturating_sub(candidate_unaccounted_held_cost::<R>(&e.get().1, resources));
+            *unaccounted_bytes = unaccounted_bytes
+                .saturating_add(candidate_unaccounted_held_cost::<R>(&cloned, resources));
+            e.insert((idx, cloned, row));
         }
         std::collections::hash_map::Entry::Occupied(_) => {}
         std::collections::hash_map::Entry::Vacant(e) => {
             let cloned = record.clone();
-            *held_bytes = held_bytes.saturating_add(record_held_cost(&cloned));
-            *unaccounted_bytes =
-                unaccounted_bytes.saturating_add(record_unaccounted_held_cost(&cloned, resources));
-            e.insert((idx, cloned));
+            *held_bytes = held_bytes.saturating_add(candidate_held_cost::<R>(&cloned));
+            *unaccounted_bytes = unaccounted_bytes
+                .saturating_add(candidate_unaccounted_held_cost::<R>(&cloned, resources));
+            e.insert((idx, cloned, row));
         }
     }
+}
+
+/// A `first` driver's held true candidate: its build input index (its
+/// arrival position), the cloned build record, and the row id the build's
+/// Source minted.
+type FirstPick = (u64, Record, RecordOrder);
+
+/// A residual failure with the global driver and build input indices its
+/// dead-letter sort tag needs beside the failure's own driver order.
+pub(super) struct TaggedFailure {
+    failure: CombineOutputEvalFailure,
+    driver_idx: u64,
+    build_idx: u64,
+}
+
+impl TaggedFailure {
+    /// Defer the failure to `sink` with its `(order, driver_idx, build_idx)`
+    /// sort tag.
+    fn push_to(self, sink: &mut EmitSink<'_>) {
+        let order = self.failure.row;
+        sink.push_failure(self.failure, order, self.driver_idx, self.build_idx);
+    }
+}
+
+/// One driver's [`DriverScan`] as the block path keeps it.
+type IeScan = DriverScan<FirstPick, TaggedFailure>;
+
+/// Resident byte cost of a `first` driver's held candidate.
+fn decisive_held_cost(held: &Decisive<FirstPick, TaggedFailure>) -> u64 {
+    match held {
+        Decisive::Match((_, record, _)) => candidate_held_cost::<RecordOrder>(record),
+        Decisive::Failure(tagged) => failure_held_cost(tagged, record_held_cost),
+    }
+}
+
+/// [`decisive_held_cost`] net of the record heap the allocation resources
+/// already account for.
+fn decisive_unaccounted_held_cost(
+    held: &Decisive<FirstPick, TaggedFailure>,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    match held {
+        Decisive::Match((_, record, _)) => {
+            candidate_unaccounted_held_cost::<RecordOrder>(record, resources)
+        }
+        Decisive::Failure(tagged) => {
+            failure_held_cost(tagged, |record| held_record_bytes(record, resources))
+        }
+    }
+}
+
+/// A held failure's cost: the driver and build records it cloned, under
+/// `record_cost`, plus the failure itself.
+fn failure_held_cost(tagged: &TaggedFailure, record_cost: impl Fn(&Record) -> u64) -> u64 {
+    let build = tagged
+        .failure
+        .matched_build
+        .as_ref()
+        .map_or(0, |build| record_cost(&build.record));
+    record_cost(&tagged.failure.probe_record)
+        .saturating_add(build)
+        .saturating_add(std::mem::size_of::<TaggedFailure>() as u64)
 }
 
 /// Per-driver match tracking shared by the pair-emit loop and the collect /
@@ -986,10 +1073,13 @@ fn keep_min(
 struct MatchState<'a> {
     allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     unaccounted_held_bytes: u64,
-    /// `matched[key]` is set once a driver has emitted at least one match.
-    /// Drives the `All` mode's unmatched sweep. `First` selection uses
-    /// `first_match` instead, so it never reads this.
-    matched: Vec<bool>,
+    /// One [`DriverScan`] per driver of the block: every candidate's residual
+    /// outcome feeds it, so the driver's verdict (a `first` selection or
+    /// failure, whether an `all` driver matched, whether a `collect` driver
+    /// failed) is the one every join strategy reaches. A `first` scan holds
+    /// the earliest candidate that is not "not true", true or failed, until
+    /// the driver block finalizes, whichever block its build landed in.
+    scans: Vec<IeScan>,
     /// Bounded max-heap per driver of the smallest-`order_key`
     /// [`COLLECT_PER_GROUP_CAP`] collect matches. Draining it sorted yields
     /// the deterministic collect array.
@@ -998,35 +1088,38 @@ struct MatchState<'a> {
     /// The matched build with the smallest `order_key`, the earliest-arriving,
     /// kept for `$ck` propagation onto the collect row, so the propagated
     /// build is the collect array's first element.
-    first_collected_builds: HashMap<usize, (u64, Record)>,
-    /// The `First`-mode candidate per driver: the residual-passing match with
-    /// the smallest build input index, the earliest-arriving build row, held
-    /// until the driver block finalizes and emits it. Bounded by one build
-    /// record per driver.
-    first_match: HashMap<usize, (u64, Record)>,
-    /// Running byte total of every cloned build record and collect entry held
-    /// above (`first_match`, `first_collected_builds`, and the `collect_accum`
-    /// heaps). The per-pair pre-output gate folds it in, so a `match: first` /
-    /// `collect` join over wide build records aborts with the typed budget
-    /// error instead of growing this residency unbounded; collect drains per
-    /// driver block. It stays zero under `all`, which emits each match
-    /// immediately and holds no build records across pairs.
+    first_collected_builds: HashMap<usize, (u64, Record, ())>,
+    /// Running byte total of every cloned build record, held `first`
+    /// failure and collect entry above. The per-pair pre-output gate folds it
+    /// in, so a `match: first` / `collect` join over wide build records aborts
+    /// with the typed budget error instead of growing this residency
+    /// unbounded; collect drains per driver block. It stays zero under `all`,
+    /// which emits each match immediately and holds no build records across
+    /// pairs. The fixed scan slots are charged with the driver block instead,
+    /// as [`MatchState::SCAN_SLOT_BYTES`] per driver.
     held_bytes: u64,
 }
 
 impl<'a> MatchState<'a> {
+    /// The fixed bytes one driver's scan slot takes, charged with the driver
+    /// block that holds it.
+    pub(super) const SCAN_SLOT_BYTES: usize = std::mem::size_of::<IeScan>();
+
+    /// State for a block of `driver_count` drivers under `mode`.
     fn new(
         driver_count: usize,
+        mode: MatchMode,
         allocation_resources: &'a clinker_record::owned_storage::AllocationResources,
     ) -> Self {
+        let mut scans: Vec<IeScan> = Vec::with_capacity(driver_count);
+        scans.extend(std::iter::repeat_with(|| DriverScan::new(mode)).take(driver_count));
         Self {
             allocation_resources,
             unaccounted_held_bytes: 0,
-            matched: vec![false; driver_count],
+            scans,
             collect_accum: HashMap::new(),
             collect_truncated: HashMap::new(),
             first_collected_builds: HashMap::new(),
-            first_match: HashMap::new(),
             held_bytes: 0,
         }
     }
@@ -1041,6 +1134,102 @@ impl<'a> MatchState<'a> {
         self.unaccounted_held_bytes
     }
 
+    fn scan(&mut self, key: usize, name: &str) -> Result<&mut IeScan, PipelineError> {
+        let driver_count = self.scans.len();
+        self.scans
+            .get_mut(key)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "iejoin match state",
+                node: name.to_string(),
+                detail: format!("driver key {key} has no scan; the block holds {driver_count}"),
+            })
+    }
+
+    /// Charge a `first` scan's newly held candidate and release the one it
+    /// displaced.
+    fn settle_admit(&mut self, key: usize, admit: &Admit<FirstPick, TaggedFailure>) {
+        let Admit::Decides { displaced } = admit else {
+            return;
+        };
+        if let Some(held) = self.scans[key].held() {
+            self.held_bytes = self.held_bytes.saturating_add(decisive_held_cost(held));
+            self.unaccounted_held_bytes =
+                self.unaccounted_held_bytes
+                    .saturating_add(decisive_unaccounted_held_cost(
+                        held,
+                        self.allocation_resources,
+                    ));
+        }
+        if let Some(old) = displaced {
+            self.held_bytes = self.held_bytes.saturating_sub(decisive_held_cost(old));
+            self.unaccounted_held_bytes =
+                self.unaccounted_held_bytes
+                    .saturating_sub(decisive_unaccounted_held_cost(
+                        old,
+                        self.allocation_resources,
+                    ));
+        }
+    }
+
+    /// Report driver `key`'s candidate at build input index `build_idx`
+    /// whose residual is true. Under `first` the scan keeps it if it is the
+    /// earliest so far, charged in [`MatchState::held_bytes`].
+    fn observe_true(
+        &mut self,
+        key: usize,
+        build_idx: u64,
+        build_record: &Record,
+        build_row: RecordOrder,
+        name: &str,
+    ) -> Result<Admit<FirstPick, TaggedFailure>, PipelineError> {
+        let admit = self
+            .scan(key, name)?
+            .observe_true(build_idx, || (build_idx, build_record.clone(), build_row));
+        self.settle_admit(key, &admit);
+        Ok(admit)
+    }
+
+    /// Report driver `key`'s candidate at build input index `build_idx`
+    /// whose residual failed. Under `first` the scan keeps the failure if it
+    /// is the earliest candidate so far, charged in
+    /// [`MatchState::held_bytes`]; under `collect` the driver's array is
+    /// released at once, since it can no longer be written.
+    fn observe_failed(
+        &mut self,
+        key: usize,
+        build_idx: u64,
+        failure: impl FnOnce() -> TaggedFailure,
+        name: &str,
+    ) -> Result<Admit<FirstPick, TaggedFailure>, PipelineError> {
+        let admit = self.scan(key, name)?.observe_failed(build_idx, failure);
+        self.settle_admit(key, &admit);
+        if matches!(admit, Admit::Fail(_)) && self.collect_accum.contains_key(&key) {
+            drop(self.take_collect(key));
+        }
+        Ok(admit)
+    }
+
+    /// Driver `key`'s verdict, releasing the charge of any candidate its
+    /// scan held. The scan is left empty.
+    fn finish(
+        &mut self,
+        key: usize,
+        mode: MatchMode,
+        name: &str,
+    ) -> Result<DriverVerdict<FirstPick, TaggedFailure>, PipelineError> {
+        let scan = std::mem::replace(self.scan(key, name)?, DriverScan::new(mode));
+        if let Some(held) = scan.held() {
+            self.held_bytes = self.held_bytes.saturating_sub(decisive_held_cost(held));
+            self.unaccounted_held_bytes =
+                self.unaccounted_held_bytes
+                    .saturating_sub(decisive_unaccounted_held_cost(
+                        held,
+                        self.allocation_resources,
+                    ));
+        }
+        Ok(scan.finish())
+    }
+
     /// Record one residual-passing collect match for `key`: extract the build's
     /// user fields, keep the bounded smallest-`order_key` set, and track the
     /// min-`order_key` build for `$ck`. Marking a driver truncated once its
@@ -1052,8 +1241,7 @@ impl<'a> MatchState<'a> {
             &mut self.first_collected_builds,
             &mut self.held_bytes,
             key,
-            order_key,
-            build_record,
+            (order_key, build_record, ()),
         );
         // Build-side records contribute only their user-declared field values:
         // `iter_user_fields` filters every engine-stamped column (`$ck.*`
@@ -1122,11 +1310,13 @@ impl<'a> MatchState<'a> {
             };
         let truncated = self.collect_truncated.remove(&key).is_some();
         let first_build = match self.first_collected_builds.remove(&key) {
-            Some((_, r)) => {
-                self.held_bytes = self.held_bytes.saturating_sub(record_held_cost(&r));
-                self.unaccounted_held_bytes = self
-                    .unaccounted_held_bytes
-                    .saturating_sub(record_unaccounted_held_cost(&r, self.allocation_resources));
+            Some((_, r, ())) => {
+                self.held_bytes = self
+                    .held_bytes
+                    .saturating_sub(candidate_held_cost::<()>(&r));
+                self.unaccounted_held_bytes = self.unaccounted_held_bytes.saturating_sub(
+                    candidate_unaccounted_held_cost::<()>(&r, self.allocation_resources),
+                );
                 Some(r)
             }
             None => None,
@@ -1136,34 +1326,6 @@ impl<'a> MatchState<'a> {
             truncated,
             first_build,
         }
-    }
-
-    /// Record one residual-passing `First`-mode candidate for the block path:
-    /// keep the match with the smallest build input index, held until the
-    /// driver block finalizes.
-    fn note_first_candidate(&mut self, key: usize, build_idx: u64, build_record: &Record) {
-        keep_min(
-            self.allocation_resources,
-            &mut self.unaccounted_held_bytes,
-            &mut self.first_match,
-            &mut self.held_bytes,
-            key,
-            build_idx,
-            build_record,
-        );
-    }
-
-    /// Remove and return this driver's held `First` candidate, releasing its
-    /// held-byte charge. Used by the block path's driver-block finalize.
-    fn take_first_candidate(&mut self, key: usize) -> Option<(u64, Record)> {
-        let taken = self.first_match.remove(&key);
-        if let Some((_, ref r)) = taken {
-            self.held_bytes = self.held_bytes.saturating_sub(record_held_cost(r));
-            self.unaccounted_held_bytes = self
-                .unaccounted_held_bytes
-                .saturating_sub(record_unaccounted_held_cost(r, self.allocation_resources));
-        }
-        taken
     }
 }
 
@@ -1311,8 +1473,9 @@ struct PairBudget<'a> {
 }
 
 /// Emit every qualifying `(driver, build)` pair in `pairs` under the
-/// combine's match mode, applying the residual filter (3+ range conjuncts) and
-/// the `First`-mode selection. `pairs` carries local indices into
+/// combine's match mode, feeding each pair's residual outcome (when the
+/// predicate has more than the two kernel-verified range conjuncts) to its
+/// driver's [`DriverScan`]. `pairs` carries local indices into
 /// `driver_slice` / `build_slice`; per-driver state is tracked in `state` under
 /// [`DriverRef::key`].
 ///
@@ -1345,76 +1508,99 @@ fn emit_pairs(
         // for the final deterministic output sort — all pure functions of the
         // data rather than the memory-derived block layout.
         let bidx = batch.build_idx[bi_local];
+        // The row the build's Source minted, from the same position, so a
+        // build-side dead letter reports the build's own row.
+        let build_row = batch.build_row[bi_local];
 
-        // 3+ range conjuncts: the residual re-checks the full predicate over
-        // the merged row (the kernel verified only the first two axes). See
-        // the module doc.
-        if let Some(residual) = evals.residual.as_mut() {
-            let resolver =
-                CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
-            match residual.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
-                Ok(EvalResult::Skip(_)) => continue,
-                Ok(EvalResult::Emit { .. }) => {}
-                Ok(EvalResult::EmitMany { .. }) => {
-                    return Err(PipelineError::Internal {
-                        op: "iejoin residual",
-                        node: cfg.name.to_string(),
-                        detail: "emit_each fan-out is not supported in a combine residual filter"
-                            .into(),
-                    });
-                }
-                Err(e) => {
-                    if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                        return Err(PipelineError::from(e));
-                    }
-                    sink.push_failure(
-                        CombineOutputEvalFailure {
+        // The residual re-checks the full predicate over the merged row when
+        // it holds more than the first two range axes the kernel verified.
+        // See the module doc. Its outcome feeds the driver's scan, so a
+        // failed residual is neither a match nor a miss.
+        let outcome = match evals.residual.as_mut() {
+            Some(residual) => {
+                let resolver =
+                    CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
+                eval_predicate::<NullStorage>(
+                    residual,
+                    &cfg.ctx.with_row(driver_order.ordinal()),
+                    &resolver,
+                    "iejoin residual",
+                    cfg.name,
+                )?
+            }
+            None => PredicateOutcome::True,
+        };
+
+        match outcome {
+            PredicateOutcome::NotTrue => {}
+            PredicateOutcome::Failed(e) => {
+                let admit = state.observe_failed(
+                    key,
+                    bidx,
+                    || TaggedFailure {
+                        failure: CombineOutputEvalFailure {
                             probe_record: driver_record.clone(),
                             row: driver_order,
-                            matched_build: Some(build_record.clone()),
+                            matched_build: Some(MatchedBuildFailure {
+                                record: build_record.clone(),
+                                row: build_row,
+                            }),
                             error: e,
                             failed_at: crate::executor::DlqFailureStamp::now(),
                         },
-                        driver_order,
-                        dref.driver_idx,
-                        bidx,
-                    );
-                    continue;
+                        driver_idx: dref.driver_idx,
+                        build_idx: bidx,
+                    },
+                    cfg.name,
+                )?;
+                // `all` and `collect` write every failure as it is found;
+                // `first` holds the earliest until the driver block
+                // finalizes, so a failure after the deciding candidate is
+                // never written, nor aborts a fail_fast run.
+                if let Admit::Fail(tagged) = admit {
+                    if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
+                        return Err(PipelineError::from(tagged.failure.error));
+                    }
+                    tagged.push_to(sink);
                 }
             }
-        }
-
-        match cfg.match_mode {
-            MatchMode::Collect => {
-                // Order key: the build's input index, so the kept set and array
-                // order are a deterministic function of the data.
-                state.record_collect_match(key, bidx, build_record);
-                // Bound the collect accumulators as they grow: they hold up to
-                // COLLECT_PER_GROUP_CAP cloned build records per driver, are never
-                // spilled, and drain only at the driver-block finalize — so a hot
-                // equality value (the case the block-nested-loop fallback is
-                // entered for) could otherwise grow them past the budget and OOM.
-                // Poll the strictly-local peak after each match and abort typed,
-                // matching the clean pre-fallback behavior for this shape.
-                let peak = pair_budget.floor.saturating_add(state.held_bytes());
-                if peak > pair_budget.budget.hard_limit() {
-                    pair_budget.consumer.set_bytes(0);
-                    return Err(pre_output_budget_error(
-                        pair_budget.name,
-                        peak,
-                        pair_budget.budget.hard_limit(),
-                    ));
-                }
-            }
-            MatchMode::First => {
-                // Hold the minimum-build-index candidate; emit at the driver
-                // block's finalize, so the selection is the same regardless of
-                // which block the winning build landed in.
-                state.note_first_candidate(key, bidx, build_record);
-            }
-            MatchMode::All => {
-                if emit_match_row(cfg, evals, dref, build_record, bidx, sink)? {
-                    state.matched[key] = true;
+            PredicateOutcome::True => {
+                let admit = state.observe_true(key, bidx, build_record, build_row, cfg.name)?;
+                match (cfg.match_mode, admit) {
+                    (MatchMode::Collect, Admit::Take) => {
+                        // Order key: the build's input index, so the kept set
+                        // and array order are a deterministic function of the
+                        // data.
+                        state.record_collect_match(key, bidx, build_record);
+                        // Bound the collect accumulators as they grow: they
+                        // hold up to COLLECT_PER_GROUP_CAP cloned build records
+                        // per driver, are never spilled, and drain only at the
+                        // driver-block finalize — so a hot equality value (the
+                        // case the block-nested-loop fallback is entered for)
+                        // could otherwise grow them past the budget and OOM.
+                        // Poll the strictly-local peak after each match and
+                        // abort typed, matching the clean pre-fallback behavior
+                        // for this shape.
+                        let peak = pair_budget.floor.saturating_add(state.held_bytes());
+                        if peak > pair_budget.budget.hard_limit() {
+                            pair_budget.consumer.set_bytes(0);
+                            return Err(pre_output_budget_error(
+                                pair_budget.name,
+                                peak,
+                                pair_budget.budget.hard_limit(),
+                            ));
+                        }
+                    }
+                    (MatchMode::All, Admit::Take) => {
+                        // The pair matched, so the driver is not a miss
+                        // whatever its body does.
+                        emit_match_row(cfg, evals, dref, build_record, bidx, build_row, sink)?;
+                    }
+                    // `first` holds its earliest candidate until the driver
+                    // block finalizes, so the selection is the same regardless
+                    // of which block the winning build landed in; a true
+                    // `collect` candidate after a failed one joins no array.
+                    _ => {}
                 }
             }
         }
@@ -1425,15 +1611,17 @@ fn emit_pairs(
 /// Materialize and push one `(driver, build)` output row for `First` / `All`:
 /// the body eval (or, for a body-less synthetic decomposition step, the
 /// driver-then-build value concat) and `$ck` propagation. The row is tagged
-/// with `build_idx` for the final deterministic output sort. Returns `true` if
-/// a row was pushed, `false` if the body eval skipped it or a recoverable eval
-/// failure was deferred.
+/// with `build_idx` for the final deterministic output sort; a deferred
+/// failure carries `build_row`, the row the build's Source minted. Returns
+/// `true` if a row was pushed, `false` if the body eval skipped it or a
+/// recoverable eval failure was deferred.
 fn emit_match_row(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
     driver: &DriverRef<'_>,
     build_record: &Record,
     build_idx: u64,
+    build_row: RecordOrder,
     sink: &mut EmitSink<'_>,
 ) -> Result<bool, PipelineError> {
     let driver_record = driver.record;
@@ -1442,7 +1630,11 @@ fn emit_match_row(
     if let Some(evaluator) = evals.body.as_mut() {
         let resolver =
             CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
-        match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+        match evaluator.eval_record::<NullStorage>(
+            &cfg.ctx.with_row(driver_order.ordinal()),
+            &resolver,
+            None,
+        ) {
             Ok(EvalResult::Emit {
                 fields,
                 record_vars,
@@ -1476,7 +1668,10 @@ fn emit_match_row(
                     CombineOutputEvalFailure {
                         probe_record: driver_record.clone(),
                         row: driver_order,
-                        matched_build: Some(build_record.clone()),
+                        matched_build: Some(MatchedBuildFailure {
+                            record: build_record.clone(),
+                            row: build_row,
+                        }),
                         error: e,
                         failed_at: crate::executor::DlqFailureStamp::now(),
                     },
@@ -1561,10 +1756,12 @@ fn flush_collect_row(
     sink.push_row(rec, driver_order, driver_idx, u64::MAX)
 }
 
-/// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
+/// Dispatch one driver with no true and no failed candidate, which `_miss`
+/// proves, through its `on_miss` policy: `Skip` drops
 /// it, `Error` surfaces the missing-match error, `NullFields` runs the body
 /// over the driver alone and emits the widened row (recoverable eval failures
 /// route to `sink.output_eval_failures`).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_on_miss(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
@@ -1572,6 +1769,7 @@ fn dispatch_on_miss(
     driver_order: RecordOrder,
     driver_idx: u64,
     on_miss: OnMiss,
+    _miss: MissToken,
     sink: &mut EmitSink<'_>,
 ) -> Result<(), PipelineError> {
     match on_miss {
@@ -1587,7 +1785,11 @@ fn dispatch_on_miss(
                 node: cfg.name.to_string(),
                 detail: "combine body typed program missing for on_miss: null_fields".to_string(),
             })?;
-            match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+            match evaluator.eval_record::<NullStorage>(
+                &cfg.ctx.with_row(driver_order.ordinal()),
+                &resolver,
+                None,
+            ) {
                 Ok(EvalResult::Emit {
                     fields,
                     record_vars,
@@ -1964,16 +2166,16 @@ mod tests {
         use std::num::NonZeroUsize;
 
         fn assert_retained(state: &MatchState<'_>) {
-            let records = state
-                .first_match
-                .values()
-                .chain(state.first_collected_builds.values())
-                .map(|(_, record)| record);
             let mut physical = 0;
             let mut relative = 0;
-            for record in records {
-                physical += record_held_cost(record);
-                relative += record_unaccounted_held_cost(record, state.allocation_resources);
+            for held in state.scans.iter().filter_map(|scan| scan.held()) {
+                physical += decisive_held_cost(held);
+                relative += decisive_unaccounted_held_cost(held, state.allocation_resources);
+            }
+            for (_, record, ()) in state.first_collected_builds.values() {
+                physical += candidate_held_cost::<()>(record);
+                relative +=
+                    candidate_unaccounted_held_cost::<()>(record, state.allocation_resources);
             }
             for entry in state.collect_accum.values().flat_map(|heap| heap.iter()) {
                 physical += collect_entry_cost(entry);
@@ -2017,14 +2219,20 @@ mod tests {
                 assert_eq!(if foreign { local.used() } else { other.used() }, 0);
                 assert!(record_held_cost(&input) > record_held_cost(&input.clone()));
 
-                let mut first = MatchState::new(1, &resources);
-                let mut collect = MatchState::new(1, &resources);
+                let mut first = MatchState::new(1, MatchMode::First, &resources);
+                let mut collect = MatchState::new(1, MatchMode::Collect, &resources);
+                let held_pick = |state: &MatchState<'_>| match state.scans[0].held() {
+                    Some(Decisive::Match((index, _, row))) => (*index, *row),
+                    other => panic!("a held first match, got {:?}", other.is_some()),
+                };
                 for index in [9, 7, 4, 1] {
-                    first.note_first_candidate(0, index, &input);
+                    first
+                        .observe_true(0, index, &input, index.into(), "first")
+                        .unwrap();
                     collect.record_collect_match(0, index, &input);
                     assert_retained(&first);
                     assert_retained(&collect);
-                    assert_eq!(first.first_match[&0].0, index);
+                    assert_eq!(held_pick(&first), (index, RecordOrder::from(index)));
                     assert_eq!(collect.first_collected_builds[&0].0, index);
                     assert!(first.unaccounted_held_bytes() > 0);
                     assert!(collect.unaccounted_held_bytes() > 0);
@@ -2034,12 +2242,17 @@ mod tests {
                         assert!(first.held_bytes() > first.unaccounted_held_bytes());
                     }
                     // Discarding a worse candidate leaves the retained winner intact.
-                    first.note_first_candidate(0, index + 1, &input);
+                    first
+                        .observe_true(0, index + 1, &input, (index + 1).into(), "first")
+                        .unwrap();
                     assert_retained(&first);
-                    assert_eq!(first.first_match[&0].0, index);
+                    assert_eq!(held_pick(&first).0, index);
                     assert_eq!(owner.used(), original_charge);
                 }
-                let taken = first.take_first_candidate(0).unwrap();
+                let taken = match first.finish(0, MatchMode::First, "first").unwrap() {
+                    DriverVerdict::Selected(pick) => pick,
+                    _ => panic!("the earliest true candidate is selected"),
+                };
                 let collected = collect.take_collect(0);
                 assert_retained(&first);
                 assert_retained(&collect);
@@ -2052,6 +2265,7 @@ mod tests {
                     (0, 0)
                 );
                 assert_eq!(taken.0, 1);
+                assert_eq!(taken.2, RecordOrder::from(1));
                 assert_eq!(collected.arr.len(), 4);
                 assert!(!collected.truncated);
                 assert!(collected.first_build.is_some());
@@ -2104,7 +2318,7 @@ mod tests {
             )),
         };
         let floor = 71;
-        let actual_peak = floor + record_held_cost(&stored) + collect_entry_cost(&entry);
+        let actual_peak = floor + candidate_held_cost::<()>(&stored) + collect_entry_cost(&entry);
         assert!(record_held_cost(&input) > record_held_cost(&stored));
         let stable = StableEvalContext::test_default();
         let ctx = EvalContext::test_default_borrowed(&stable);
@@ -2113,7 +2327,7 @@ mod tests {
         for limit in [actual_peak - 1, actual_peak, actual_peak + 1] {
             let budget = MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy));
             let consumer = ConsumerHandle::new();
-            let mut state = MatchState::new(1, &resources);
+            let mut state = MatchState::new(1, MatchMode::Collect, &resources);
             let cfg = EmitConfig {
                 allocation_resources: &resources,
                 name: "collect_boundary",
@@ -2141,6 +2355,7 @@ mod tests {
                 driver_slice: &driver,
                 build_slice: &[&input],
                 build_idx: &[0],
+                build_row: &[RecordOrder::from(0)],
             };
             let mut buffer = SortBuffer::new_payload_ordered(
                 usize::MAX,
@@ -2189,6 +2404,86 @@ mod tests {
             owner.used(),
             0,
             "unique text copies are independent legacy storage"
+        );
+    }
+
+    /// A `first` driver's held candidate is charged while it is held,
+    /// whether it is a true one or a failed one: an earlier candidate
+    /// displaces the held one and releases its charge, a later one is never
+    /// cloned, and finishing the driver releases what is left.
+    #[test]
+    fn first_held_failures_are_charged_and_displaced_by_earlier_candidates() {
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1 << 20).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone();
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
+        let driver = Record::new(schema.clone(), vec![Value::String("driver".into())]);
+        let build = Record::new(schema, vec![Value::String("x".repeat(300).into())]);
+        let failure = |index: u64| TaggedFailure {
+            failure: CombineOutputEvalFailure {
+                probe_record: driver.clone(),
+                row: RecordOrder::from(1),
+                matched_build: Some(MatchedBuildFailure {
+                    record: build.clone(),
+                    row: RecordOrder::from(index),
+                }),
+                error: EvalError::division_by_zero(cxl::lexer::Span::new(0, 0)),
+                failed_at: crate::executor::DlqFailureStamp::now(),
+            },
+            driver_idx: 0,
+            build_idx: index,
+        };
+        let mut state = MatchState::new(2, MatchMode::First, &resources);
+        let slots = 0;
+
+        // Driver 0: a failure at index 5 is held and charged.
+        state.observe_failed(0, 5, || failure(5), "first").unwrap();
+        let failure_cost = state.held_bytes() - slots;
+        assert!(
+            failure_cost >= record_held_cost(&driver) + record_held_cost(&build),
+            "the held failure charges both records it cloned"
+        );
+        // A later failure is never built and changes nothing.
+        let mut built = false;
+        state
+            .observe_failed(
+                0,
+                9,
+                || {
+                    built = true;
+                    failure(9)
+                },
+                "first",
+            )
+            .unwrap();
+        assert!(!built, "a failure after the held one is never built");
+        assert_eq!(state.held_bytes(), slots + failure_cost);
+        // An earlier true candidate displaces it and releases its charge.
+        state
+            .observe_true(0, 2, &build, RecordOrder::from(2), "first")
+            .unwrap();
+        assert_eq!(
+            state.held_bytes(),
+            slots + candidate_held_cost::<RecordOrder>(&build),
+            "the displaced failure's charge is released"
+        );
+        // Driver 1: only a failure, which decides.
+        state.observe_failed(1, 3, || failure(3), "first").unwrap();
+        assert!(matches!(
+            state.finish(0, MatchMode::First, "first").unwrap(),
+            DriverVerdict::Selected((2, _, _))
+        ));
+        match state.finish(1, MatchMode::First, "first").unwrap() {
+            DriverVerdict::FailedFirst(tagged) => assert_eq!(tagged.build_idx, 3),
+            _ => panic!("driver 1's held failure decides"),
+        }
+        assert_eq!(
+            (state.held_bytes(), state.unaccounted_held_bytes()),
+            (slots, slots),
+            "finishing every driver releases every held candidate"
         );
     }
 

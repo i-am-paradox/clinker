@@ -480,13 +480,60 @@ pub(crate) struct CombineOutputEvalFailure {
     /// The matched build record when the failure occurred on a matched pair
     /// (residual or matched body); `None` for an `on_miss: null_fields`
     /// failure where no build row contributed.
-    pub matched_build: Option<Record>,
+    pub matched_build: Option<MatchedBuildFailure>,
     /// The captured eval error. `EvalError` is `Clone`, so stashing the
     /// failing error per row and replaying it from the dispatcher is sound.
     pub error: EvalError,
     /// Taken in the kernel as the failure is observed, so the dead letter
     /// the dispatcher emits after the kernel returns reports that moment.
     pub failed_at: crate::executor::DlqFailureStamp,
+}
+
+/// The build record a failing Combine output row matched, with the row id
+/// its Source minted. The two travel as one value so a dead letter can never
+/// pair a build record with another row's identity. `record` supplies
+/// diagnostics and correlation lineage; `row` is the authoritative identity.
+#[derive(Debug, Clone)]
+pub(crate) struct MatchedBuildFailure {
+    pub record: Record,
+    pub row: crate::executor::stream_event::SourceRowId,
+}
+
+/// Resident bytes of one record a combine path holds beyond the call that
+/// produced it: the record struct plus the heap `resources` does not already
+/// account for.
+///
+/// Every path that holds a failure or a candidate record charges it by this
+/// one formula, so the block join's held failures and the streaming probe's
+/// are priced alike and the memory arbitrator sees comparable figures.
+pub(crate) fn held_record_bytes(
+    record: &Record,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) -> u64 {
+    (std::mem::size_of::<Record>() + record.unaccounted_heap_size(resources)) as u64
+}
+
+/// The row id of the build candidate at `index` in `build_rows`, which a
+/// join kernel keeps aligned with its candidate indices. A candidate without
+/// one is an engine invariant violation, reported as
+/// `PipelineError::Internal` under `op` and the Combine `name`.
+pub(crate) fn matched_build_row(
+    build_rows: &[crate::executor::stream_event::SourceRowId],
+    index: usize,
+    op: &'static str,
+    name: &str,
+) -> Result<crate::executor::stream_event::SourceRowId, clinker_plan::error::PipelineError> {
+    build_rows
+        .get(index)
+        .copied()
+        .ok_or_else(|| clinker_plan::error::PipelineError::Internal {
+            op,
+            node: name.to_string(),
+            detail: format!(
+                "matched build index {index} has no aligned source-row identity; {} are held",
+                build_rows.len()
+            ),
+        })
 }
 
 /// A combine kernel's emitted rows plus any recoverable output-stage eval

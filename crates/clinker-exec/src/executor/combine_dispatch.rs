@@ -20,13 +20,17 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, declare_node_buffer_readers,
-    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
-    record_error_to_buffer_if_grouped, require_node_buffer_input, source_file_arc_of,
-    source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
+    require_node_buffer_input, source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
+    tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
     DlqEntry, DlqFailureStamp, NullStorage, stage_metrics, widen_record_to_schema,
+};
+use crate::pipeline::combine::{MatchedBuildFailure, held_record_bytes};
+use crate::pipeline::combine_verdict::{
+    Admit, DriverScan, DriverVerdict, MissToken, PredicateOutcome, eval_predicate,
 };
 use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
@@ -681,8 +685,8 @@ where
             // never lingers in the arbitrator's registry.
             let result = (|| -> Result<(), PipelineError> {
                 // Advance per-source `rollback_cursors` for every
-                // build-side record before its `row_num` is dropped
-                // in the `(r, _)` map. Source→Combine direct paths
+                // build-side record before `build_buf` moves into the
+                // kernel with its row ids. Source→Combine direct paths
                 // (no intermediate Transform/Aggregate to advance the
                 // cursor on the way through) would otherwise leave
                 // the build source's cursor anchored at zero. Same
@@ -694,13 +698,12 @@ where
                 for (rec, rn) in &build_buf {
                     advance_cursor(ctx, &source_name_arc_of(rec), *rn);
                 }
-                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-                let build_records_in = build_records.len() as u64;
+                let build_records_in = build_buf.len() as u64;
                 let build_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
                         name: name.clone(),
                     });
-                let build_records_out = build_records.len() as u64;
+                let build_records_out = build_buf.len() as u64;
                 ctx.collector
                     .record(build_timer.finish(build_records_in, build_records_out));
                 let probe_records_in = driver_buf.len() as u64;
@@ -726,7 +729,7 @@ where
                 let iejoin_ctx = ctx.merged_eval_ctx();
                 // CPU-bound block-band IEJoin kernel — external-sort +
                 // block-band range walk over a bounded working set. The
-                // kernel owns its inputs (`driver_buf`, `build_records`)
+                // kernel owns its inputs (`driver_buf`, `build_buf`)
                 // and borrows only `&ctx.memory_budget` + the local
                 // `iejoin_ctx`, so it runs on the shared Rayon pool. Row
                 // order is the deterministic `(driver order, driver_idx,
@@ -740,7 +743,7 @@ where
                                 name,
                                 build_qualifier: &build_qualifier,
                                 driver_records: driver_buf,
-                                build_records,
+                                build_records: build_buf,
                                 decomposed,
                                 body_program: body_typed,
                                 resolver_mapping: &resolver_mapping,
@@ -861,13 +864,12 @@ where
                 for (rec, rn) in &build_buf {
                     advance_cursor(ctx, &source_name_arc_of(rec), *rn);
                 }
-                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-                let build_records_in = build_records.len() as u64;
+                let build_records_in = build_buf.len() as u64;
                 let build_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
                         name: name.clone(),
                     });
-                let build_records_out = build_records.len() as u64;
+                let build_records_out = build_buf.len() as u64;
                 ctx.collector
                     .record(build_timer.finish(build_records_in, build_records_out));
                 let probe_records_in = driver_buf.len() as u64;
@@ -901,7 +903,7 @@ where
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
-                        build_records,
+                        build_records: build_buf,
                         decomposed,
                         body_program: body_typed,
                         resolver_mapping: &resolver_mapping,
@@ -937,7 +939,7 @@ where
                         node_idx,
                         &f.probe_record,
                         f.row,
-                        f.matched_build.as_ref().map(|record| (record, f.row)),
+                        f.matched_build.as_ref(),
                         name,
                         f.error,
                         f.failed_at,
@@ -1007,13 +1009,12 @@ where
                 for (rec, rn) in &build_buf {
                     advance_cursor(ctx, &source_name_arc_of(rec), *rn);
                 }
-                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-                let build_records_in = build_records.len() as u64;
+                let build_records_in = build_buf.len() as u64;
                 let build_timer =
                     stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
                         name: name.clone(),
                     });
-                let build_records_out = build_records.len() as u64;
+                let build_records_out = build_buf.len() as u64;
                 ctx.collector
                     .record(build_timer.finish(build_records_in, build_records_out));
                 let probe_records_in = driver_buf.len() as u64;
@@ -1047,7 +1048,7 @@ where
                         name,
                         build_qualifier: &build_qualifier,
                         driver_records: driver_buf,
-                        build_records,
+                        build_records: build_buf,
                         decomposed,
                         body_program: body_typed,
                         resolver_mapping: &resolver_mapping,
@@ -1264,6 +1265,7 @@ where
                     name,
                     &kernel,
                     &budget,
+                    &inline_consumer_handle,
                 )?;
                 // The driver streamed its records over the channel, so the input
                 // count comes from the probe thread rather than a pre-drained Vec.
@@ -1289,6 +1291,8 @@ where
                 // driver row. `KeyExtractor::extract_into` pushes onto the end; the
                 // kernel clears it before each call.
                 let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
+                // One driver's failures, drained after each probe.
+                let mut probe_failures: Vec<ProbeFailure> = Vec::new();
 
                 for (probe_record, rn) in driver_buf {
                     let source_file_arc = source_file_arc_of(&probe_record);
@@ -1300,32 +1304,30 @@ where
                         rn,
                         probe_record.doc_ctx(),
                     );
-                    let step = kernel.probe_row(
+                    kernel.probe_row(
                         &eval_ctx,
                         &probe_record,
                         rn,
                         &mut probe_keys_buf,
-                        &mut probe_counters,
-                        &mut output_records,
+                        ProbeSink {
+                            rows: &mut output_records,
+                            failures: &mut probe_failures,
+                            counters: &mut probe_counters,
+                        },
                     )?;
-                    if let ProbeRowStep::Deferred(f) = step {
-                        let f = *f;
+                    // Each failing match is its own failure; the driver's
+                    // successful matches keep their output rows.
+                    for f in probe_failures.drain(..) {
                         dispatch_combine_output_error(
                             ctx,
                             node_idx,
                             &f.probe_record,
                             f.rn,
-                            f.matched_build
-                                .as_ref()
-                                .map(|matched| (&matched.record, matched.row)),
+                            f.matched_build.as_ref(),
                             name,
                             f.error,
                             f.failed_at,
                         )?;
-                        // A deferred failure routes the whole driver row to the DLQ;
-                        // no output rows survive for it.
-                        output_records.truncate(before);
-                        continue;
                     }
                     emitted_since_check += output_records.len() - before;
 
@@ -1455,7 +1457,56 @@ struct StreamingProbeEffects {
     /// Recoverable per-row failures, replayed via [`dispatch_combine_output_error`]
     /// after join (cursor rewind + DLQ) — matching the inline arm's per-row
     /// routing in arrival order. `FailFast` surfaces eagerly instead.
+    ///
+    /// Each failure owns a clone of the driver row and of the build row it
+    /// failed on, and under `match: all` a hot key adds one per failing pair,
+    /// so the vector grows with the fan-out rather than with the driver. The
+    /// probe thread charges each one to the combine's consumer as it is
+    /// appended and the replay discharges it as it is written; see
+    /// [`Self::charge_new_failures`].
     failures: Vec<ProbeFailure>,
+    /// How many leading entries of `failures` are already charged.
+    charged_failures: usize,
+}
+
+impl StreamingProbeEffects {
+    /// Charge the failures appended since the last call to `consumer` and
+    /// return how many there were. The replay discharges each failure by the
+    /// same [`ProbeFailure::held_bytes`], so a fully replayed probe nets to
+    /// zero.
+    fn charge_new_failures(
+        &mut self,
+        consumer: &crate::pipeline::memory::ConsumerHandle,
+        resources: &clinker_record::owned_storage::AllocationResources,
+    ) -> usize {
+        let fresh = &self.failures[self.charged_failures..];
+        let bytes = fresh
+            .iter()
+            .fold(0u64, |sum, f| sum.saturating_add(f.held_bytes(resources)));
+        if bytes > 0 {
+            consumer.add_bytes(bytes);
+        }
+        self.charged_failures = self.failures.len();
+        fresh.len()
+    }
+}
+
+/// Read the streaming channel to disconnect, discharging each record's
+/// per-row cost, so the driver producer's `send` can never block on a probe
+/// thread that has stopped consuming. Every early return from the probe loop
+/// drains first.
+fn drain_probe_channel(
+    rx: &crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
+    charge_handle: &crate::pipeline::memory::ConsumerHandle,
+    resources: &clinker_record::owned_storage::AllocationResources,
+) {
+    while let Ok(event) = rx.recv() {
+        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event {
+            charge_handle.sub_bytes(crate::executor::node_buffer::unaccounted_record_byte_cost(
+                &record, resources,
+            ));
+        }
+    }
 }
 
 /// Drive an inline hash build-probe Combine's probe (driver) side off a
@@ -1479,6 +1530,19 @@ struct StreamingProbeEffects {
 /// sequencing match the drain-to-`Vec` path exactly. Mid-stream
 /// `$source.count` is `None` (the driver total is unknown until disconnect),
 /// the same defer-emit semantic the streaming Aggregate ingest uses.
+///
+/// The failures the thread holds until the join are charged to `held`, the
+/// combine's own consumer, as each is appended, and discharged as the replay
+/// writes it. Under `match: all` a hot key fails once per failing pair, so
+/// the held set grows with the key's fan-out, not with the driver. The thread
+/// polls the arbitrator once 10,000 rows and failures have accrued, the
+/// cadence the materialized loop uses, and only between drivers. The overshoot
+/// past the arbitrator's limit is therefore one cadence window plus the
+/// failures of the driver in flight, not the whole stream's. The materialized
+/// loop writes each driver's failures as it goes
+/// and holds none, which this path cannot: the thread has no way to reach the
+/// dead-letter output until it joins.
+#[allow(clippy::too_many_arguments)]
 fn run_streaming_combine_probe(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -1487,6 +1551,7 @@ fn run_streaming_combine_probe(
     name: &str,
     kernel: &CombineProbeKernel<'_>,
     budget: &crate::pipeline::memory::MemoryArbitrator,
+    held: &crate::pipeline::memory::ConsumerHandle,
 ) -> Result<StreamingProbeOutput, PipelineError> {
     use crate::executor::stream_event::StreamEvent;
     use cxl::eval::EvalContext;
@@ -1516,6 +1581,7 @@ fn run_streaming_combine_probe(
         cursor_advances: Vec::new(),
         driver_sources: Vec::new(),
         failures: Vec::new(),
+        charged_failures: 0,
     };
     let mut output_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut driver_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
@@ -1572,17 +1638,7 @@ fn run_streaming_combine_probe(
                     // A schema mismatch is a fatal E314 in both paths; drain
                     // to disconnect first so the driver `send` cannot
                     // deadlock, then surface.
-                    while let Ok(event) = rx.recv() {
-                        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event
-                        {
-                            charge_handle.sub_bytes(
-                                crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                    &record,
-                                    &allocation_resources,
-                                ),
-                            );
-                        }
-                    }
+                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
                     return Err(err);
                 }
 
@@ -1616,62 +1672,42 @@ fn run_streaming_combine_probe(
                 };
 
                 let before = output_records.len();
-                let step = match kernel.probe_row(
+                match kernel.probe_row(
                     &eval_ctx,
                     &record,
                     rn,
                     &mut probe_keys_buf,
-                    &mut counters,
-                    &mut output_records,
+                    ProbeSink {
+                        rows: &mut output_records,
+                        failures: &mut effects.failures,
+                        counters: &mut counters,
+                    },
                 ) {
-                    Ok(step) => step,
+                    Ok(()) => {}
                     Err(e) => {
                         // Fatal (FailFast surfacing, on_miss::error,
                         // planner-invariant) — drain to disconnect, then
                         // surface.
-                        while let Ok(event) = rx.recv() {
-                            if let crate::executor::stream_event::StreamEvent::Record(record, _) =
-                                event
-                            {
-                                charge_handle.sub_bytes(
-                                    crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                        &record,
-                                        &allocation_resources,
-                                    ),
-                                );
-                            }
-                        }
+                        drain_probe_channel(&rx, &charge_handle, &allocation_resources);
                         return Err(e);
                     }
                 };
-                if let ProbeRowStep::Deferred(f) = step {
-                    // The whole driver row routes to the DLQ; no output rows
-                    // survive for it.
-                    output_records.truncate(before);
-                    effects.failures.push(*f);
-                    continue;
-                }
 
                 // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
                 // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
                 // the match above already surfaces after draining the channel — so
                 // the streaming path is covered without a separate check here.
 
-                // Budget check every 10K emitted records, the same cadence
-                // and abort the materialized loop uses.
-                budget_cadence += output_records.len() - before;
+                // Charge the failures this driver added before the budget
+                // check, so the check sees them. They are held until the
+                // join, not written as the materialized loop writes its own.
+                let new_failures = effects.charge_new_failures(held, &allocation_resources);
+
+                // Budget check every 10K emitted or failed records, the same
+                // cadence and abort the materialized loop uses.
+                budget_cadence += output_records.len() - before + new_failures;
                 if budget_cadence >= 10_000 && budget.should_abort() {
-                    while let Ok(event) = rx.recv() {
-                        if let crate::executor::stream_event::StreamEvent::Record(record, _) = event
-                        {
-                            charge_handle.sub_bytes(
-                                crate::executor::node_buffer::unaccounted_record_byte_cost(
-                                    &record,
-                                    &allocation_resources,
-                                ),
-                            );
-                        }
-                    }
+                    drain_probe_channel(&rx, &charge_handle, &allocation_resources);
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.to_string(),
                         used: budget.peak_rss().unwrap_or(0),
@@ -1746,18 +1782,20 @@ fn run_streaming_combine_probe(
         advance_cursor(ctx, &source_name_arc, rn);
     }
     for f in std::mem::take(&mut effects.failures) {
+        let held_bytes = f.held_bytes(&allocation_resources);
         dispatch_combine_output_error(
             ctx,
             node_idx,
             &f.probe_record,
             f.rn,
-            f.matched_build
-                .as_ref()
-                .map(|matched| (&matched.record, matched.row)),
+            f.matched_build.as_ref(),
             name,
             f.error,
             f.failed_at,
         )?;
+        // Written (or handed to the group that holds it): no longer this
+        // probe's to charge.
+        held.sub_bytes(held_bytes);
     }
 
     ctx.counters.filtered_count += counters.filtered;
@@ -1768,22 +1806,6 @@ fn run_streaming_combine_probe(
         input_count,
         driver_puncts,
     })
-}
-
-/// Per-driver-row outcome the probe kernel returns to its caller. The
-/// materialized inline loop and the streaming-probe thread both drive
-/// [`CombineProbeKernel::probe_row`], which emits output rows directly into
-/// the caller's buffer and signals row-level disposition here. Fatal errors
-/// (FailFast surfacing, `on_miss: error`, planner-invariant violations,
-/// `EmitMany` fan-out) short-circuit as `Err` instead.
-enum ProbeRowStep {
-    /// The row produced zero or more output records (already pushed) and
-    /// the driver loop continues.
-    Continue,
-    /// A recoverable per-row eval failure under `Continue`. The caller
-    /// routes it through `dispatch_combine_output_error` (cursor rewind +
-    /// DLQ) — inline immediately, or after the streaming join.
-    Deferred(Box<ProbeFailure>),
 }
 
 /// A recoverable combine output-row failure deferred for DLQ routing. The
@@ -1800,13 +1822,29 @@ struct ProbeFailure {
     failed_at: DlqFailureStamp,
 }
 
-/// Exact build-side contribution attached to an inline combine output-row
-/// failure. `record` supplies diagnostics and correlation lineage; `row`
-/// remains the authoritative attempt-local identity used for deduplication.
-#[derive(Clone)]
-struct MatchedBuildFailure {
-    record: Record,
-    row: crate::executor::stream_event::SourceRowId,
+impl ProbeFailure {
+    /// Resident bytes this failure holds while it waits to be written: the
+    /// driver row and the build row it cloned, each priced by
+    /// [`held_record_bytes`], plus the failure itself. The same figure charges
+    /// the failure when it is appended and discharges it when it is written,
+    /// so the two cannot disagree.
+    fn held_bytes(&self, resources: &clinker_record::owned_storage::AllocationResources) -> u64 {
+        let build = self
+            .matched_build
+            .as_ref()
+            .map_or(0, |build| held_record_bytes(&build.record, resources));
+        held_record_bytes(&self.probe_record, resources)
+            .saturating_add(build)
+            .saturating_add(std::mem::size_of::<Self>() as u64)
+    }
+}
+
+/// Where [`CombineProbeKernel::probe_row`] puts what one driver produced:
+/// its output rows, its recoverable failures, and its skip counts.
+struct ProbeSink<'a> {
+    rows: &'a mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    failures: &'a mut Vec<ProbeFailure>,
+    counters: &'a mut ProbeCounters,
 }
 
 /// `distinct` / `filtered` skip counts the probe kernel accumulates so the
@@ -1861,14 +1899,7 @@ impl CombineProbeKernel<'_> {
         &self,
         index: usize,
     ) -> Result<crate::executor::stream_event::SourceRowId, PipelineError> {
-        self.build_row_ids
-            .get(index)
-            .copied()
-            .ok_or_else(|| PipelineError::Internal {
-                op: "combine",
-                node: self.name.to_string(),
-                detail: format!("matched build index {index} has no aligned source-row identity"),
-            })
+        crate::pipeline::combine::matched_build_row(self.build_row_ids, index, "combine", self.name)
     }
 
     /// Fail loud with E325 if the combine's cumulative output has already reached
@@ -1888,25 +1919,155 @@ impl CombineProbeKernel<'_> {
         Ok(())
     }
 
+    /// The residual's outcome for one `(driver, build)` pair, or `True` when
+    /// the predicate has no residual beyond its equality keys.
+    fn residual_outcome(
+        &self,
+        residual_eval: Option<&mut ProgramEvaluator>,
+        eval_ctx: &cxl::eval::EvalContext<'_>,
+        probe_record: &Record,
+        build_record: &Record,
+    ) -> Result<PredicateOutcome, PipelineError> {
+        let Some(residual_eval) = residual_eval else {
+            return Ok(PredicateOutcome::True);
+        };
+        let resolver = crate::executor::combine::CombineResolver::new(
+            self.resolver_mapping,
+            probe_record,
+            Some(build_record),
+        );
+        eval_predicate::<NullStorage>(
+            residual_eval,
+            eval_ctx,
+            &resolver,
+            "combine residual",
+            self.name,
+        )
+    }
+
+    /// Apply `on_miss` to a driver whose scan found no true and no failed
+    /// candidate: `skip` drops it, `error` raises E319, `null_fields` runs the
+    /// body over the driver alone. `_miss` is the scan's proof that the
+    /// driver is a miss.
+    fn apply_on_miss(
+        &self,
+        _miss: MissToken,
+        eval_ctx: &cxl::eval::EvalContext<'_>,
+        probe_record: &Record,
+        rn: crate::executor::stream_event::SourceRowId,
+        sink: ProbeSink<'_>,
+    ) -> Result<(), PipelineError> {
+        use crate::executor::combine::CombineResolver;
+        use clinker_plan::config::pipeline_node::OnMiss;
+        let ProbeSink {
+            rows: out,
+            failures,
+            counters,
+        } = sink;
+        let name = self.name;
+        match self.on_miss {
+            OnMiss::Skip => Ok(()),
+            OnMiss::Error => Err(PipelineError::CombineMissingMatch {
+                combine: name.to_string(),
+                driver_row: rn.ordinal(),
+            }),
+            OnMiss::NullFields => {
+                let resolver = CombineResolver::new(self.resolver_mapping, probe_record, None);
+                let body = self
+                    .body_program
+                    .as_ref()
+                    .ok_or_else(|| PipelineError::Internal {
+                        op: "combine",
+                        node: name.to_string(),
+                        detail: "combine body typed program missing for on_miss: null_fields"
+                            .to_string(),
+                    })?;
+                let mut evaluator = ProgramEvaluator::new(Arc::clone(body), false);
+                match evaluator.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
+                    Ok(EvalResult::Emit {
+                        fields: emitted,
+                        record_vars,
+                        ..
+                    }) => {
+                        let mut rec = match self.combine_output_schema.as_ref() {
+                            Some(s) => widen_record_to_schema(probe_record, s),
+                            None => probe_record.clone(),
+                        };
+                        for (n, v) in emitted {
+                            rec.set(&n, v);
+                        }
+                        for (k, v) in *record_vars {
+                            let _ = rec.set_record_var(&k, v);
+                        }
+                        self.check_output_cap(out.len())?;
+                        out.push((rec, rn));
+                        Ok(())
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Filtered)) => {
+                        counters.filtered += 1;
+                        Ok(())
+                    }
+                    Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
+                        counters.distinct += 1;
+                        Ok(())
+                    }
+                    Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
+                        op: "combine on_miss body",
+                        node: name.to_string(),
+                        detail: "emit_each fan-out is not supported in a combine body".into(),
+                    }),
+                    Err(e) => {
+                        if self.fail_fast {
+                            return Err(PipelineError::from(e));
+                        }
+                        // on_miss path: no build row matched, so only the
+                        // driver source rewinds.
+                        failures.push(ProbeFailure {
+                            probe_record: probe_record.clone(),
+                            rn,
+                            matched_build: None,
+                            error: e,
+                            failed_at: DlqFailureStamp::now(),
+                        });
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
     /// Probe one driver record against the materialized hash table, pushing
-    /// every emitted `(Record, row_num)` into `out` and accumulating
-    /// `distinct` / `filtered` skips into `counters`. Returns
-    /// [`ProbeRowStep::Continue`] on success (zero or more rows emitted) or
-    /// [`ProbeRowStep::Deferred`] for a recoverable per-row failure the
-    /// caller routes through the DLQ (or as `Err` when `self.fail_fast` is
-    /// set). The signature is `&mut ExecutorContext`-free so the streaming
-    /// probe thread can call it.
+    /// every emitted `(Record, row_num)` into `out`, every recoverable
+    /// output-stage failure into `failures`, and accumulating `distinct` /
+    /// `filtered` skips into `counters`.
+    ///
+    /// Each candidate's residual outcome feeds one [`DriverScan`], so the
+    /// driver's verdict is the one every join strategy reaches: a failing
+    /// residual is neither a match nor a miss. Under `all` each failed pair is
+    /// one failure, with that pair's build row, and each true pair runs the
+    /// body; under `first` the earliest candidate that is not "not true"
+    /// decides; under `collect` a failed candidate leaves no row. Only a
+    /// driver with no true and no failed candidate reaches `on_miss`. A
+    /// probe-key or `on_miss: null_fields` failure is one failure with no
+    /// build row. Fatal errors (`FailFast`
+    /// surfacing, `on_miss: error`, planner-invariant violations) return
+    /// `Err`. The caller routes `failures` through the DLQ; the signature is
+    /// `&mut ExecutorContext`-free so the streaming probe thread can call it.
     fn probe_row(
         &self,
         eval_ctx: &cxl::eval::EvalContext<'_>,
         probe_record: &Record,
         rn: crate::executor::stream_event::SourceRowId,
         probe_keys_buf: &mut Vec<Value>,
-        counters: &mut ProbeCounters,
-        out: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
-    ) -> Result<ProbeRowStep, PipelineError> {
+        sink: ProbeSink<'_>,
+    ) -> Result<(), PipelineError> {
+        let ProbeSink {
+            rows: out,
+            failures,
+            counters,
+        } = sink;
         use crate::executor::combine::CombineResolver;
-        use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
+        use clinker_plan::config::pipeline_node::MatchMode;
 
         let name = self.name;
 
@@ -1924,76 +2085,95 @@ impl CombineProbeKernel<'_> {
             }
             // No build candidate matched yet — the failure is on the probe
             // key itself, so only the driver source rewinds.
-            return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+            failures.push(ProbeFailure {
                 probe_record: probe_record.clone(),
                 rn,
                 matched_build: None,
                 error: e,
                 failed_at: DlqFailureStamp::now(),
-            })));
+            });
+            return Ok(());
         }
+
+        let mut residual_eval = self
+            .decomposed
+            .residual
+            .as_ref()
+            .map(|residual| ProgramEvaluator::new(Arc::clone(residual), false));
 
         match self.match_mode {
             MatchMode::Collect => {
+                let mut scan: DriverScan<(), ProbeFailure> = DriverScan::new(MatchMode::Collect);
                 let mut arr: Vec<Value> = Vec::new();
                 let mut first_collected_build: Option<Record> = None;
                 let mut truncated = false;
                 let probe_iter = self.hash_table.probe(probe_keys_buf);
-                for candidate in probe_iter {
-                    if let Some(residual) = self.decomposed.residual.as_ref() {
-                        let resolver = CombineResolver::new(
-                            self.resolver_mapping,
-                            probe_record,
-                            Some(candidate.record),
-                        );
-                        let mut residual_eval = ProgramEvaluator::new(Arc::clone(residual), false);
-                        match residual_eval.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
-                            Ok(EvalResult::Skip(SkipReason::Filtered)) => continue,
-                            Ok(EvalResult::Emit { .. }) => {}
-                            Ok(EvalResult::EmitMany { .. }) => {
-                                return Err(PipelineError::Internal {
-                                    op: "combine residual",
-                                    node: name.to_string(),
-                                    detail:
-                                        "emit_each fan-out is not supported in a combine residual filter"
-                                            .into(),
-                                });
-                            }
-                            Ok(EvalResult::Skip(SkipReason::Duplicate)) => continue,
-                            Err(e) => {
-                                if self.fail_fast {
-                                    return Err(PipelineError::from(e));
-                                }
-                                return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
-                                    probe_record: probe_record.clone(),
-                                    rn,
-                                    matched_build: Some(MatchedBuildFailure {
-                                        record: candidate.record.clone(),
-                                        row: self.build_row_id(candidate.index)?,
-                                    }),
-                                    error: e,
-                                    failed_at: DlqFailureStamp::now(),
-                                })));
-                            }
+                // The table yields a key's candidates in build arrival order,
+                // so the walk position is the candidate order.
+                for (order, candidate) in probe_iter.enumerate() {
+                    let order = order as u64;
+                    let admit = match self.residual_outcome(
+                        residual_eval.as_mut(),
+                        eval_ctx,
+                        probe_record,
+                        candidate.record,
+                    )? {
+                        PredicateOutcome::True => scan.observe_true(order, || ()),
+                        PredicateOutcome::NotTrue => continue,
+                        PredicateOutcome::Failed(e) => {
+                            let row = self.build_row_id(candidate.index)?;
+                            scan.observe_failed(order, || ProbeFailure {
+                                probe_record: probe_record.clone(),
+                                rn,
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: candidate.record.clone(),
+                                    row,
+                                }),
+                                error: e,
+                                failed_at: DlqFailureStamp::now(),
+                            })
                         }
+                    };
+                    match admit {
+                        Admit::Take => {
+                            if arr.len() >= COLLECT_PER_GROUP_CAP {
+                                // Past the cap no element is kept, but every
+                                // later candidate is still evaluated so each
+                                // failure among them is written.
+                                truncated = true;
+                                continue;
+                            }
+                            if first_collected_build.is_none() {
+                                first_collected_build = Some(candidate.record.clone());
+                            }
+                            // Build a `Value::Map` for every matched build
+                            // record, preserving its own schema order.
+                            // `iter_user_fields` filters engine-stamped columns
+                            // (`$ck.*`, `$widened`) so a build record's sidecar
+                            // Map payload never nests and reaches the writer as
+                            // a nested Map.
+                            let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
+                            for (fname, val) in candidate.record.iter_user_fields() {
+                                m.insert(fname.into(), val.clone());
+                            }
+                            arr.push(Value::Map(OwnedMap::from_map(m)));
+                        }
+                        Admit::Fail(failure) => {
+                            if self.fail_fast {
+                                return Err(PipelineError::from(failure.error));
+                            }
+                            failures.push(failure);
+                            // The array is unknown now; release what it held.
+                            arr = Vec::new();
+                            first_collected_build = None;
+                        }
+                        Admit::Decides { .. } | Admit::Ignore => {}
                     }
-                    if arr.len() >= COLLECT_PER_GROUP_CAP {
-                        truncated = true;
-                        break;
-                    }
-                    if first_collected_build.is_none() {
-                        first_collected_build = Some(candidate.record.clone());
-                    }
-                    // Build a `Value::Map` for every matched build record,
-                    // preserving its own schema order. `iter_user_fields`
-                    // filters engine-stamped columns (`$ck.*`, `$widened`)
-                    // so a build record's sidecar Map payload never nests
-                    // and reaches the writer as a nested Map.
-                    let mut m: IndexMap<OwnedKey, Value> = IndexMap::new();
-                    for (fname, val) in candidate.record.iter_user_fields() {
-                        m.insert(fname.into(), val.clone());
-                    }
-                    arr.push(Value::Map(OwnedMap::from_map(m)));
+                }
+                match scan.finish() {
+                    DriverVerdict::Collected => {}
+                    DriverVerdict::CollectFailed => return Ok(()),
+                    other => return Err(other.mode_mismatch("combine", name)),
                 }
                 if truncated {
                     eprintln!(
@@ -2019,138 +2199,93 @@ impl CombineProbeKernel<'_> {
                 );
                 self.check_output_cap(out.len())?;
                 out.push((rec, rn));
-                Ok(ProbeRowStep::Continue)
+                Ok(())
             }
 
             MatchMode::First | MatchMode::All => {
-                // Residual-filter + emit pass. Clone each surviving build
-                // record before dropping the iterator so the evaluator
-                // borrow doesn't alias the hash-table borrow.
-                let matched_records: Vec<MatchedBuildFailure> = {
-                    let probe_iter = self.hash_table.probe(probe_keys_buf);
-                    let mut matched: Vec<MatchedBuildFailure> = Vec::new();
-                    for candidate in probe_iter {
-                        if let Some(residual) = self.decomposed.residual.as_ref() {
-                            let resolver = CombineResolver::new(
-                                self.resolver_mapping,
-                                probe_record,
-                                Some(candidate.record),
-                            );
-                            let mut residual_eval =
-                                ProgramEvaluator::new(Arc::clone(residual), false);
-                            match residual_eval
-                                .eval_record::<NullStorage>(eval_ctx, &resolver, None)
-                            {
-                                Ok(EvalResult::Skip(_)) => continue,
-                                Ok(EvalResult::Emit { .. }) => {}
-                                Ok(EvalResult::EmitMany { .. }) => {
-                                    return Err(PipelineError::Internal {
-                                        op: "combine residual",
-                                        node: name.to_string(),
-                                        detail:
-                                            "emit_each fan-out is not supported in a combine residual filter"
-                                                .into(),
-                                    });
-                                }
-                                Err(e) => {
-                                    if self.fail_fast {
-                                        return Err(PipelineError::from(e));
-                                    }
-                                    return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
-                                        probe_record: probe_record.clone(),
-                                        rn,
-                                        matched_build: Some(MatchedBuildFailure {
-                                            record: candidate.record.clone(),
-                                            row: self.build_row_id(candidate.index)?,
-                                        }),
-                                        error: e,
-                                        failed_at: DlqFailureStamp::now(),
-                                    })));
-                                }
+                // Residual pass. Clone each true candidate's build record
+                // before dropping the iterator so the body evaluator borrow
+                // doesn't alias the hash-table borrow.
+                let mut scan: DriverScan<MatchedBuildFailure, ProbeFailure> =
+                    DriverScan::new(self.match_mode);
+                let mut taken: Vec<MatchedBuildFailure> = Vec::new();
+                let probe_iter = self.hash_table.probe(probe_keys_buf);
+                // The table yields a key's candidates in build arrival order,
+                // so the walk position is the candidate order and a `first`
+                // driver stops at its deciding candidate.
+                for (order, candidate) in probe_iter.enumerate() {
+                    if scan.settled() {
+                        break;
+                    }
+                    let order = order as u64;
+                    let row = self.build_row_id(candidate.index)?;
+                    match self.residual_outcome(
+                        residual_eval.as_mut(),
+                        eval_ctx,
+                        probe_record,
+                        candidate.record,
+                    )? {
+                        PredicateOutcome::True => {
+                            let admit = scan.observe_true(order, || MatchedBuildFailure {
+                                record: candidate.record.clone(),
+                                row,
+                            });
+                            if let Admit::Take = admit {
+                                taken.push(MatchedBuildFailure {
+                                    record: candidate.record.clone(),
+                                    row,
+                                });
                             }
                         }
-                        matched.push(MatchedBuildFailure {
-                            record: candidate.record.clone(),
-                            row: self.build_row_id(candidate.index)?,
-                        });
-                        if matches!(self.match_mode, MatchMode::First) {
-                            break;
+                        PredicateOutcome::NotTrue => {}
+                        PredicateOutcome::Failed(e) => {
+                            let admit = scan.observe_failed(order, || ProbeFailure {
+                                probe_record: probe_record.clone(),
+                                rn,
+                                matched_build: Some(MatchedBuildFailure {
+                                    record: candidate.record.clone(),
+                                    row,
+                                }),
+                                error: e,
+                                failed_at: DlqFailureStamp::now(),
+                            });
+                            if let Admit::Fail(failure) = admit {
+                                if self.fail_fast {
+                                    return Err(PipelineError::from(failure.error));
+                                }
+                                failures.push(failure);
+                            }
                         }
                     }
-                    matched
+                }
+
+                let matched_records = match scan.finish() {
+                    DriverVerdict::Selected(pick) => vec![pick],
+                    DriverVerdict::Pairs => taken,
+                    DriverVerdict::FailedFirst(failure) => {
+                        if self.fail_fast {
+                            return Err(PipelineError::from(failure.error));
+                        }
+                        failures.push(failure);
+                        return Ok(());
+                    }
+                    DriverVerdict::Miss(miss) => {
+                        return self.apply_on_miss(
+                            miss,
+                            eval_ctx,
+                            probe_record,
+                            rn,
+                            ProbeSink {
+                                rows: out,
+                                failures,
+                                counters,
+                            },
+                        );
+                    }
+                    other => return Err(other.mode_mismatch("combine", name)),
                 };
 
-                if matched_records.is_empty() {
-                    match self.on_miss {
-                        OnMiss::Skip => Ok(ProbeRowStep::Continue),
-                        OnMiss::Error => Err(PipelineError::CombineMissingMatch {
-                            combine: name.to_string(),
-                            driver_row: rn.ordinal(),
-                        }),
-                        OnMiss::NullFields => {
-                            let resolver =
-                                CombineResolver::new(self.resolver_mapping, probe_record, None);
-                            let body = self.body_program.as_ref().ok_or_else(|| {
-                                PipelineError::Internal {
-                                    op: "combine",
-                                    node: name.to_string(),
-                                    detail: "combine body typed program missing for on_miss: null_fields"
-                                        .to_string(),
-                                }
-                            })?;
-                            let mut evaluator = ProgramEvaluator::new(Arc::clone(body), false);
-                            match evaluator.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
-                                Ok(EvalResult::Emit {
-                                    fields: emitted,
-                                    record_vars,
-                                    ..
-                                }) => {
-                                    let mut rec = match self.combine_output_schema.as_ref() {
-                                        Some(s) => widen_record_to_schema(probe_record, s),
-                                        None => probe_record.clone(),
-                                    };
-                                    for (n, v) in emitted {
-                                        rec.set(&n, v);
-                                    }
-                                    for (k, v) in *record_vars {
-                                        let _ = rec.set_record_var(&k, v);
-                                    }
-                                    self.check_output_cap(out.len())?;
-                                    out.push((rec, rn));
-                                    Ok(ProbeRowStep::Continue)
-                                }
-                                Ok(EvalResult::Skip(SkipReason::Filtered)) => {
-                                    counters.filtered += 1;
-                                    Ok(ProbeRowStep::Continue)
-                                }
-                                Ok(EvalResult::Skip(SkipReason::Duplicate)) => {
-                                    counters.distinct += 1;
-                                    Ok(ProbeRowStep::Continue)
-                                }
-                                Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
-                                    op: "combine on_miss body",
-                                    node: name.to_string(),
-                                    detail: "emit_each fan-out is not supported in a combine body"
-                                        .into(),
-                                }),
-                                Err(e) => {
-                                    if self.fail_fast {
-                                        return Err(PipelineError::from(e));
-                                    }
-                                    // on_miss path: no build row matched, so
-                                    // only the driver source rewinds.
-                                    Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
-                                        probe_record: probe_record.clone(),
-                                        rn,
-                                        matched_build: None,
-                                        error: e,
-                                        failed_at: DlqFailureStamp::now(),
-                                    })))
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(body) = self.body_program.as_ref() {
+                if let Some(body) = self.body_program.as_ref() {
                     let mut evaluator = ProgramEvaluator::new(Arc::clone(body), false);
                     for matched in &matched_records {
                         let resolver = CombineResolver::new(
@@ -2196,17 +2331,18 @@ impl CombineProbeKernel<'_> {
                                 if self.fail_fast {
                                     return Err(PipelineError::from(e));
                                 }
-                                return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
+                                failures.push(ProbeFailure {
                                     probe_record: probe_record.clone(),
                                     rn,
                                     matched_build: Some(matched.clone()),
                                     error: e,
                                     failed_at: DlqFailureStamp::now(),
-                                })));
+                                });
+                                continue;
                             }
                         }
                     }
-                    Ok(ProbeRowStep::Continue)
+                    Ok(())
                 } else {
                     // Body-less synthetic step from N-ary combine
                     // decomposition: the encoded output schema concatenates
@@ -2244,7 +2380,7 @@ impl CombineProbeKernel<'_> {
                         self.check_output_cap(out.len())?;
                         out.push((rec, rn));
                     }
-                    Ok(ProbeRowStep::Continue)
+                    Ok(())
                 }
             }
         }
@@ -2269,7 +2405,7 @@ fn dispatch_combine_output_errors(
             node_idx,
             &f.probe_record,
             f.row,
-            f.matched_build.as_ref().map(|record| (record, f.row)),
+            f.matched_build.as_ref(),
             combine_name,
             f.error,
             f.failed_at,
@@ -2821,30 +2957,29 @@ fn adopt_spilled_runs_into_node_buffer(
 }
 
 /// Route one combine output-row failure to the dead-letter path: rewind the
-/// contributing sources, then park or push the probe-side trigger and, when a
-/// build row contributed, a build-side entry. `failed_at` is the stamp taken
-/// where the failure was observed, which may be a probe thread or a kernel
-/// that returned long after; the build-side entry shares its time under its
-/// own id.
+/// contributing sources, then hold or write the failure: the probe-side
+/// trigger and, when a build row contributed, the build-side row with it.
+/// `failed_at` is the stamp taken where the failure was observed, which may
+/// be a probe thread or a kernel that returned long after; the build-side row
+/// shares its time and trigger id under its own id. Under correlation
+/// buffering the failure is held with the probe row's group, so the build
+/// row is written or rolled back with that group and condemns nothing by
+/// itself.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_combine_output_error(
     ctx: &mut ExecutorContext<'_>,
     node_idx: NodeIndex,
     probe_record: &Record,
     row_num: crate::executor::stream_event::SourceRowId,
-    matched_build: Option<(&Record, crate::executor::stream_event::SourceRowId)>,
+    matched_build: Option<&MatchedBuildFailure>,
     combine_name: &str,
     eval_err: cxl::eval::EvalError,
     failed_at: DlqFailureStamp,
 ) -> Result<(), PipelineError> {
-    let category = clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow;
-    let stage = Some(DlqEntry::stage_combine(combine_name));
-    let message = eval_err.to_string();
-
     let probe_source = source_name_arc_of(probe_record);
     let build_source = matched_build
         .as_ref()
-        .map(|(record, _)| source_name_arc_of(record));
+        .map(|matched| source_name_arc_of(&matched.record));
 
     // Rewind every contributing source to its captured pre-fold floor
     // before admitting any DLQ entry. The snapshot was taken at fold
@@ -2873,81 +3008,108 @@ fn dispatch_combine_output_error(
         }
     }
 
-    // Trigger entry on the probe row's source. Park under the
-    // correlation group cell when buffering is active so the group stays
-    // atomic; otherwise push directly to the run-scoped DLQ.
-    let triggering_field = eval_err.triggering_field.clone();
-    let triggering_value = eval_err.triggering_value();
-    let routed = record_error_to_buffer_if_grouped(
-        ctx,
-        probe_record,
+    // One failure: the probe row as its trigger and, when a build row
+    // contributed, that build row with it, held together so the build row is
+    // always written right after the trigger it names. Under correlation
+    // buffering the failure is held with the probe row's group, never under
+    // the build record's own key: the build record did not fail, so it must
+    // not condemn its own group, nor the output of any other driver that
+    // matched it and succeeded.
+    let mut failure = crate::executor::held_failure::HeldFailure::new(
         row_num,
-        category,
-        message.clone(),
-        stage.clone(),
+        probe_record.clone(),
+        clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow,
+        eval_err.to_string(),
+        Some(DlqEntry::stage_combine(combine_name)),
         None,
+        eval_err.triggering_field.clone(),
+        eval_err.triggering_value(),
         failed_at,
     );
-    if !routed {
-        push_dlq(
-            ctx,
-            DlqEntry {
-                source_row: row_num,
-                category,
-                error_message: message.clone(),
-                original_record: probe_record.clone(),
-                stage: stage.clone(),
-                route: None,
-                trigger: true,
-                source_name: Arc::clone(&probe_source),
-                triggering_field,
-                triggering_value,
-                failed_at,
-            },
-        )?;
+    if let Some(matched) = matched_build {
+        failure = failure.with_contributing_build(matched.record.clone(), matched.row);
     }
+    if let Some(failure) = crate::executor::held_failure::hold_failure_if_grouped(ctx, failure) {
+        crate::executor::held_failure::write_failure(ctx, failure)?;
+    }
+    Ok(())
+}
 
-    // When a build row contributed, attribute a build-side entry too so
-    // the contributing build lineage reaches the DLQ. The matched record and
-    // its identity travel as one pair so attribution cannot silently mix a
-    // build record with an unrelated row id.
-    if let Some((build_record, build_row_num)) = matched_build {
-        // One failure, two dead letters: the build side keeps the failure's
-        // time and trigger id under its own id, so it pairs with the driver
-        // row wherever it is held.
-        let build_failed_at = failed_at.sibling();
-        let build_routed = record_error_to_buffer_if_grouped(
-            ctx,
-            build_record,
-            build_row_num,
-            category,
-            message.clone(),
-            stage.clone(),
-            None,
-            build_failed_at,
-        );
-        if !build_routed {
-            let build_source_name = build_source
-                .clone()
-                .unwrap_or_else(|| source_name_arc_of(build_record));
-            push_dlq(
-                ctx,
-                DlqEntry {
-                    source_row: build_row_num,
-                    category,
-                    error_message: message,
-                    original_record: build_record.clone(),
-                    stage,
-                    route: None,
-                    trigger: false,
-                    source_name: build_source_name,
-                    triggering_field: None,
-                    triggering_value: None,
-                    failed_at: build_failed_at,
-                },
-            )?;
+#[cfg(test)]
+mod probe_failure_charge_tests {
+    use super::*;
+    use clinker_record::owned_storage::SharedStorage;
+    use clinker_record::{Schema, Value};
+
+    fn failure(schema: &SharedStorage<Schema>, text: &str, with_build: bool) -> ProbeFailure {
+        let record = Record::new(schema.clone(), vec![Value::String(text.into())]);
+        ProbeFailure {
+            probe_record: record.clone(),
+            rn: 0u64.into(),
+            matched_build: with_build.then(|| MatchedBuildFailure {
+                record,
+                row: 1u64.into(),
+            }),
+            error: cxl::eval::EvalError::division_by_zero(cxl::lexer::Span::new(0, 0)),
+            failed_at: DlqFailureStamp::now(),
         }
     }
 
-    Ok(())
+    #[test]
+    fn held_failures_are_charged_once_and_discharge_to_zero() {
+        let schema = SharedStorage::from_arc(Arc::new(Schema::new(vec!["v".into()])));
+        let resources = clinker_format::preparation::MemoryOnlyResources::new(
+            std::num::NonZeroUsize::new(1024 * 1024).unwrap(),
+        )
+        .resources()
+        .allocation()
+        .clone();
+        let consumer = crate::pipeline::memory::ConsumerHandle::new();
+        let mut effects = StreamingProbeEffects {
+            cursor_advances: Vec::new(),
+            driver_sources: Vec::new(),
+            failures: Vec::new(),
+            charged_failures: 0,
+        };
+
+        effects
+            .failures
+            .push(failure(&schema, &"x".repeat(1000), true));
+        assert_eq!(effects.charge_new_failures(&consumer, &resources), 1);
+        let pair = effects.failures[0].held_bytes(&resources);
+        let floor = 2 * std::mem::size_of::<Record>() + std::mem::size_of::<ProbeFailure>();
+        assert!(
+            pair >= floor as u64,
+            "a failure holding a driver row and a build row owns at least both records and \
+             itself: {pair} < {floor}"
+        );
+        assert_eq!(consumer.bytes(), pair);
+
+        assert_eq!(
+            effects.charge_new_failures(&consumer, &resources),
+            0,
+            "a failure already charged is not charged again"
+        );
+        assert_eq!(consumer.bytes(), pair);
+
+        effects.failures.push(failure(&schema, "y", false));
+        assert_eq!(effects.charge_new_failures(&consumer, &resources), 1);
+        let alone = effects.failures[1].held_bytes(&resources);
+        assert!(
+            alone < pair,
+            "a failure with no build row holds one record fewer"
+        );
+        assert_eq!(consumer.bytes(), pair + alone);
+        assert_eq!(consumer.peak_bytes(), pair + alone);
+
+        for f in std::mem::take(&mut effects.failures) {
+            consumer.sub_bytes(f.held_bytes(&resources));
+        }
+        assert_eq!(consumer.bytes(), 0, "a fully replayed probe nets to zero");
+        assert_eq!(
+            consumer.peak_bytes(),
+            pair + alone,
+            "the high-water mark keeps what the probe held"
+        );
+    }
 }
