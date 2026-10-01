@@ -4,6 +4,7 @@
 //! to produce a human-readable provenance chain showing which configuration
 //! layer won and which were shadowed.
 
+use clinker_core_types::QuoteName;
 use std::fmt;
 
 use crate::config::composition::{
@@ -105,11 +106,23 @@ impl fmt::Display for ProvenanceExplainError {
                 param_name,
                 valid_params,
             } => {
-                write!(f, "no provenance for '{node_name}.{param_name}'")?;
+                write!(
+                    f,
+                    "no provenance for {}.{param_name}",
+                    node_name.quoted_name()
+                )?;
                 if valid_params.is_empty() {
-                    write!(f, "\n  node '{node_name}' has no tracked config params")
+                    write!(
+                        f,
+                        "\n  node {node_name} has no tracked config params",
+                        node_name = node_name.quoted_name()
+                    )
                 } else {
-                    write!(f, "\n  valid params for '{node_name}':")?;
+                    write!(
+                        f,
+                        "\n  valid params for {node_name}:",
+                        node_name = node_name.quoted_name()
+                    )?;
                     for p in valid_params {
                         write!(f, "\n    - {node_name}.{p}")?;
                     }
@@ -120,7 +133,11 @@ impl fmt::Display for ProvenanceExplainError {
                 node_name,
                 valid_nodes,
             } => {
-                write!(f, "no provenance entries for node '{node_name}'")?;
+                write!(
+                    f,
+                    "no provenance entries for node {node_name}",
+                    node_name = node_name.quoted_name()
+                )?;
                 if valid_nodes.is_empty() {
                     write!(f, "\n  no composition nodes with tracked config found")
                 } else {
@@ -135,7 +152,11 @@ impl fmt::Display for ProvenanceExplainError {
                 source,
                 valid_sources,
             } => {
-                write!(f, "no schema provenance for source '{source}'")?;
+                write!(
+                    f,
+                    "no schema provenance for source {source}",
+                    source = source.quoted_name()
+                )?;
                 if valid_sources.is_empty() {
                     write!(f, "\n  no sources with tracked schema found")
                 } else {
@@ -152,7 +173,7 @@ impl fmt::Display for ProvenanceExplainError {
                 valid_columns,
             } => {
                 write!(f, "no schema provenance for '{source}.{column}'")?;
-                write!(f, "\n  columns of '{source}':")?;
+                write!(f, "\n  columns of {source}:", source = source.quoted_name())?;
                 for c in valid_columns {
                     write!(f, "\n    - {source}.{c}")?;
                 }
@@ -839,7 +860,7 @@ mod tests {
                 "# Error E110: an extraction selection names a node absent from the execution-plan DAG"
             )
         );
-        assert!(e110.contains("selected node 'clean_oder'"));
+        assert!(e110.contains(r#"selected node "clean_oder""#));
 
         let e117 = explain_code("E117").expect("E117 has a reserved-name page");
         assert_eq!(
