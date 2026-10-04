@@ -17,6 +17,7 @@ mod dlq;
 pub(crate) mod document_dlq;
 pub(crate) mod envelope;
 pub(crate) mod envelope_dispatch;
+pub(crate) mod extent_log;
 pub(crate) mod held_failure;
 mod ingest;
 pub(crate) mod invariant;
@@ -55,6 +56,12 @@ use context::{SourceRuntimePolicy, build_stable_eval_context};
 pub use dispatch::DispatchFaultGuard;
 pub use dlq::{DlqEntry, DlqFailureStamp};
 pub(crate) use dlq::{SourceRejectionEvent, SourceRejectionKind};
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use document_dlq::take_document_dlq_peak_charged_bytes_for_testing;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use document_dlq::{DocumentDlqTeardown, take_document_dlq_teardown_for_testing};
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
@@ -1572,6 +1579,15 @@ impl PipelineExecutor {
                 .collect();
             Some(crate::executor::document_dlq::DocumentDlqState::new(
                 doc_sources,
+                Arc::clone(&memory_budget),
+                crate::executor::document_dlq::HeldLogConfig {
+                    spill_root: Arc::clone(&spill_root_path),
+                    compress: params.spill_compress,
+                    batch_size: config
+                        .pipeline
+                        .batch_size
+                        .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE),
+                },
             ))
         } else {
             None
@@ -1940,6 +1956,10 @@ impl PipelineExecutor {
         // tripped shutdown token surfaces as `PipelineError::Interrupted`
         // from a per-node poll, which lands here too so the same
         // drain-then-join cleanup runs.
+        // Under document dead-lettering every Sink waits for every operator
+        // of its pass, so each document's verdict is final before any Sink
+        // writes; the plan orders Sinks last on the same predicate.
+        let sinks_after_operators = ctx.document_dlq.is_some();
         let dispatch_sequence: Vec<petgraph::graph::NodeIndex> = if !init_phase_set.is_empty() {
             let runtime_set: HashSet<petgraph::graph::NodeIndex> = plan
                 .topo_order
@@ -1952,12 +1972,14 @@ impl PipelineExecutor {
                 &ctx.memory_budget,
                 &init_phase_set,
                 &ctx.streaming_combine_probe_edges,
+                sinks_after_operators,
             );
             seq.extend(scheduled_pass_order(
                 plan,
                 &ctx.memory_budget,
                 &runtime_set,
                 &ctx.streaming_combine_probe_edges,
+                sinks_after_operators,
             ));
             seq
         } else {
@@ -1968,6 +1990,7 @@ impl PipelineExecutor {
                 &ctx.memory_budget,
                 &all,
                 &ctx.streaming_combine_probe_edges,
+                sinks_after_operators,
             )
         };
 
@@ -2180,6 +2203,9 @@ impl PipelineExecutor {
         // above (and any `?` propagation) instead drop the guard implicitly as
         // part of dropping `ctx`, which runs the same lock-before-removal `Drop`,
         // so the directory is cleaned up on EVERY path, not just this one.
+        // The document dead-letter state drops first: its held log's file is
+        // inside the directory, and an open file can block its removal.
+        drop(ctx.document_dlq.take());
         drop(ctx.spill_root);
 
         let rollback_cursors: BTreeMap<String, u64> = ctx

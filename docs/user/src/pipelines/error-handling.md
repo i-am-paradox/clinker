@@ -189,7 +189,41 @@ DLQ files use does not grow with the number of failures.
   [`dlq_granularity: document`](#document-level-dlq), records are held until
   their group or document is decided. That is those features' own state,
   described in their sections, not DLQ output; the rows they dead-letter are
-  then written like any other.
+  then written like any other. Under `dlq_granularity: document` the engine
+  also keeps, for each rejected document, a compressed record of which rows
+  it has already written, so a row held by several Sinks is written once.
+  That record is charged to the memory budget. While a Sink writes a
+  rejected document's rows, the record grows by:
+  - up to 16 bytes per row when the Sink receives the rows in the order
+    their Source read them;
+  - up to 96 bytes per row when it receives them in any other order, for
+    example after a Sort on a data column;
+  - up to 672 bytes per row for a document whose rows span its Source's
+    4,294,967,296th row, in any order. A Source counts its rows across every
+    file it reads.
+
+  The first row of each document a Sink starts costs up to 920 bytes. The
+  growth is released when the Sink's pass ends, or every 65,536 rows of a
+  document. Between releases one document's record therefore grows by at
+  most about 1 MiB when its rows arrive in the order they were read, about
+  6 MiB in any other order, and about 42 MiB when its rows span the
+  4,294,967,296th row. For example, 65,535 rows that alternate between a
+  document's first 65,536 rows and its next 65,536 grow the record to about
+  5.8 MB, and the release at the next row brings it back to 880 bytes. Once released, the
+  record costs at most 4 bytes per written row, plus 96 bytes for every
+  65,536 rows of the document, written or not, plus under 1 KiB. That is
+  about 2.3 KiB for a million-row document whose rows are contiguous. When
+  only one row in each 65,536 is written, it is 88 bytes per written row
+  plus 672 bytes, within the cap of about 100 bytes per written row. The
+  record cannot spill: if one more row would not fit once every held row
+  (below) has moved to disk, the run fails with E310. A failed document's
+  failing records are
+  formatted as DLQ rows when they fail and held until the document is
+  rejected. They are held in memory, charged to the memory budget, and move
+  to one file in the spill directory only when the budget needs the memory,
+  counting toward `storage.spill.disk_cap_bytes` (E320). With memory to
+  spare nothing is written to disk. If even one more held row would not fit
+  with every held row on disk, the run fails with E310.
 
 Disk bounds how much DLQ output a run can produce: the free space at the
 staging location, and the publication attempt's byte ceiling
@@ -237,7 +271,10 @@ error_handling:
   `min_records` rows have been read. The numerator counts dead-letter rows,
   collateral rows included, whether or not they have a DLQ file to go to. A
   source row counts once for each failure it took part in, so a row that
-  failed twice counts twice, with or without a correlation key.
+  failed twice counts twice, with or without a correlation key. Under
+  `dlq_granularity: document`, a row that failed twice at the Source, in a
+  Transform or in a Route is written once and counts once (see
+  [Document-level DLQ](#document-level-dlq)).
 - [`type_error_threshold`](#type-error-threshold) (E368) stops the run when
   the fraction of declared source-type failures crosses the threshold. It
   catches a schema mismatch at the Source, before the failing rows reach
@@ -255,7 +292,7 @@ Every DLQ record includes these metadata columns:
 |--------|-------------|
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier), unique to the row. It is taken together with `_cxl_dlq_timestamp`, so ids order the same way as timestamps. |
 | `_cxl_dlq_trigger_id` | The `_cxl_dlq_id` of the trigger row whose failure produced this row. That trigger row is always written in the same run. A trigger row points to itself, so `_cxl_dlq_trigger` is `true` exactly when this value equals `_cxl_dlq_id`; every row one failure produced carries the same value. See [Pairing the rows one failure produced](#pairing-the-rows-one-failure-produced). |
-| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) carries the time its correlation group or document was condemned. A `group_size_exceeded` row carries the time its group went over `max_group_buffer`. |
+| `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the failure was observed, not of when the row was written. A collateral row (`correlated`, `document_rejected`) carries the time its correlation group or document was condemned, except that a rejected document's other failing records carry the time each one failed. A `group_size_exceeded` row carries the time its group went over `max_group_buffer`. |
 | `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_name` | Name of the Source the failing record came from (or `<merged>` when the record carries no Source identity) |
 | `_cxl_dlq_source_row` | 1-based row number in the source file |
@@ -287,9 +324,20 @@ Two rules decide which rows a DLQ file holds:
   own category, detail, triggering field and value, stage and route. A row
   that fails twice, on two Route branches or against two Combine build rows,
   is written twice. A Combine failure also writes the build row that
-  contributed to it, right after its trigger.
+  contributed to it, right after its trigger. Under
+  `dlq_granularity: document` this rule has an exception: a rejected
+  document's later failing record is written as a `document_rejected` row
+  paired with the document's first failure, and a record that failed twice
+  at the Source, in a Transform or in a Route is written once
+  ([#1316](https://github.com/rustpunk/clinker/issues/1316); see
+  [Document-level DLQ](#document-level-dlq)).
 - **Each condemned row once.** A correlation group or document that fails
   adds each of its other rows once, as a collateral of its first failure.
+  Under `dlq_granularity: document`, a record that an Aggregate, a Combine or
+  a Reshape failure dead-lettered is written again, as a `document_rejected`
+  row, only when a Sink on another branch also received it and its document
+  is rejected. If its document is not rejected, that Sink can publish it
+  (see [Not covered](#document-dlq-not-covered)).
 
 A correlation key never removes, merges or relabels a failure row: the same
 failures are written with and without a key, and the key only adds the rows
@@ -560,19 +608,32 @@ nodes:
       dlq_granularity: document   # record (default) | document
 ```
 
-Under `dlq_granularity: document` and the `continue` strategy, when any record of a document fails:
+Under `dlq_granularity: document` and the `continue` strategy, a document is rejected when one of its records fails at the Source (against its declared type, or a structural rule), in a Transform, or in a Route. A record that fails in an Aggregate, a Combine or a Reshape is dead-lettered as its own row, as under record granularity, and does not reject its document ([#1232](https://github.com/rustpunk/clinker/issues/1232); see [Not covered](#document-dlq-not-covered)). When a document is rejected:
 
 - the failing record becomes the **root-cause** DLQ entry (`_cxl_dlq_trigger = true`, carrying its original error category);
-- every other record of the same document becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`);
-- **no** record of that document reaches the success sink.
+- every other record of the document that reaches a Sink becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`); a record dropped before any Sink is not written;
+- every other record of the document that fails at the Source, in a Transform or in a Route is also a `document_rejected` collateral, written right after the root cause in the order the records failed. These records are stamped (`_cxl_dlq_id`, `_cxl_dlq_timestamp`) when they fail; the records a Sink held are stamped when the Sink rejects the document. Every collateral carries the root cause's id in `_cxl_dlq_trigger_id`;
+- **no** record read from that document is written by any Sink, however many Sinks read it. Rows derived from the document's records can still reach a Sink; see [Not covered](#document-dlq-not-covered).
 
 Clean documents in the same run stream through untouched, and records from sibling sources still on the default `record` granularity keep per-record semantics — the policy is per source.
+
+**Sinks run last.** Every Sink runs after every other node, so a document's verdict is final before any Sink writes one of its records. `--explain` lists the Sinks last. Dead-letter rows that other nodes write directly come before the rows a Sink writes.
+
+**Several Sinks.** Each source row of a rejected document appears in the DLQ once, however many Sinks reached it. A row that failed is written as it was when it failed, ahead of any Sink's copy of it. Any other row is written as it was held by the first Sink, in run order, that held it; a row that reached only a later Sink (a Route sent it there, say) is written by that Sink. Rows are matched by source row, so of the records one [`emit each`](../cxl/emit-each.md) makes from a source row, one is written. Every collateral, whichever Sink writes it, names the document's root-cause entry in `_cxl_dlq_trigger_id`.
+
+There is one exception, described under [Not covered](#document-dlq-not-covered): a record that an Aggregate, a Combine or a Reshape failure dead-lettered (for a Combine, the driver row and the build row it matched) is written for that failure. It is written again, as a `document_rejected` row, only when a Sink on another branch also received it and its document is rejected; if its document is not rejected, that Sink can publish it ([#1232](https://github.com/rustpunk/clinker/issues/1232)). The rows a Combine or an Aggregate writes for a rejected document, and the rows that pass through a Reshape, are not held back at all.
 
 This is the document-shaped analogue of [correlation keys](#correlation-key): use it when partial processing of a document (an EDI interchange, a batch file with a header/trailer) is worse than rejecting the whole document. Unlike correlation keys, which group across files by a key value, document-level DLQ scopes rejection to a single document's records.
 
 **Document grain.** The document is the **outermost** level — the source file. For a flat format (CSV, JSON, plain XML) each input file is one document. For a nested-envelope format (an X12 `ISA → GS → ST` interchange, an EDIFACT `UNB → UNG → UNH`) the document is the whole **interchange / file**, not an inner functional group or transaction set: a failure anywhere in the interchange rejects the entire interchange, including the transaction sets that validated cleanly. Reject the inner-level grain instead by partitioning the input so each interchange is its own file is not currently offered — the grain is fixed at the file.
 
-**DLQ rate.** Every emitted entry — the trigger and each collateral — counts toward the configured DLQ `max_rate`, matching the correlated-collateral precedent. A rejected 1000-record document contributes 1000 DLQ entries. It does **not** affect [`type_error_threshold`](#type-error-threshold), whose numerator contains only declared source-type failures.
+**DLQ rate.** Each dead-letter row — the trigger and each collateral — counts once toward the configured DLQ `max_rate`, matching the correlated-collateral precedent, however many Sinks held it; a record written twice under the exception in [Several Sinks](#document-level-dlq) counts twice. A rejected 1000-record document contributes 1000 when every one of its records reaches a Sink. It does **not** affect [`type_error_threshold`](#type-error-threshold), whose numerator contains only declared source-type failures.
+
+`dlq_count` never counts a row that `ok_count` also counts, because no Sink writes a record read from a rejected document, with these exceptions, each described under [Not covered](#document-dlq-not-covered):
+
+- a record that an Aggregate, a Combine or a Reshape failure dead-lettered, which a Sink on another branch can still write when its document is not rejected ([#1232](https://github.com/rustpunk/clinker/issues/1232));
+- a rejected document's rows that a Combine or an Aggregate writes, or that pass through a Reshape, which reach a Sink while the document's records are dead-lettered;
+- a record whose joined or aggregated row fails in a node after the Combine or Aggregate: that failure is written while the record itself can still reach a Sink on another branch.
 
 **Memory.** The engine buffers each open document's records until its boundary, then flushes the document clean to the sink or rejects it and drops the buffer. Peak memory scales with the **concurrently-open** documents, not the total input; a single very large document spills its buffer to disk under the run's memory budget rather than holding everything in RAM. See [Streaming vs blocking](../ops/streaming-vs-blocking.md) for the spill model.
 
@@ -589,7 +650,43 @@ populations, so a pipeline containing both `dlq_granularity: document` and any
 `correlation_key` to keep document rejection, or set `dlq_granularity: record`
 to keep correlation rejection.
 
-**Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a blocking stage (Sort, hash Aggregate, grace-hash Combine) between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling stage is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory.
+**Composition restriction.** A composition body may not declare a Sink when any
+Source uses `dlq_granularity: document` (E378): a body Sink runs inside its
+composition, where it cannot be held back until every document's verdict is
+final. Declare the Sink at pipeline level instead. Where moving it through a
+new composition output port works today, the diagnostic prints that move ready
+to paste. Otherwise it names `clinker explain --code E378`, which shows how to
+declare the Sink's work at pipeline level.
+
+<a id="document-dlq-not-covered"></a>
+
+**Not covered.** Document rejection does not yet reach these rows:
+
+- A row failure inside an Aggregate, a Combine or a Reshape is dead-lettered
+  per record and does not reject its document
+  ([#1232](https://github.com/rustpunk/clinker/issues/1232)). When a Sink on
+  another branch also received that record, it is written again as a
+  `document_rejected` row if another failure rejects its document, and that
+  Sink can publish it if none does.
+- The rows a Combine or an Aggregate writes are not held back by their
+  document's verdict, so a rejected document's joined or aggregated rows
+  still reach a Sink. A failure on such a row, in any node after the Combine
+  or Aggregate, dead-letters only that row and does not reject its document,
+  so the document's other records, and that row's own source record on
+  another branch, can still be published
+  ([#1317](https://github.com/rustpunk/clinker/issues/1317)).
+- A Reshape's output rows do not keep their input row's document, so a
+  rejected document's rows that pass through a Reshape still reach a Sink.
+- In a pipeline where any Source declares `dlq_granularity: document`, a CSV
+  [`join_values`](../formats/csv.md#writing-multi-value-cells-join_values)
+  collision with `on_conflict: error` at a Sink fails the run rather than
+  dead-lettering the record
+  ([#933](https://github.com/rustpunk/clinker/issues/933)).
+
+A document is identified by its file path, so two Sources reading the same
+file share one verdict.
+
+**Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a Sort between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling Sort is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory. The rows a hash Aggregate or a grace-hash Combine writes are not held back by their document's verdict, spilled or not; see [Not covered](#document-dlq-not-covered).
 
 ### Malformed envelopes (structural validation)
 

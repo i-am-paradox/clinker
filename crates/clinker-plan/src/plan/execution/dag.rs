@@ -461,6 +461,465 @@ pub(crate) fn diagnose_untagged_composition_edges(
     out
 }
 
+/// E378: refuse a Sink inside any composition body while a Source declares
+/// `dlq_granularity: document`.
+///
+/// Document granularity guarantees that no Sink writes a record of a
+/// document that is rejected. The plan and the scheduler hold that
+/// guarantee by running every Sink after every other node, so each
+/// document's verdict is final before any Sink writes. A body Sink would run
+/// inside its composition's dispatch, in the middle of the top-level walk,
+/// where that ordering cannot reach it. Body Sinks do not write in a run yet
+/// (#1242); the refusal keeps the guarantee for when they do, rather than
+/// guaranteeing it for some Sinks only.
+///
+/// The help gives one fix. Where moving the Sink to the pipeline through a
+/// new composition output port runs on the engine as it is, the help is
+/// that move as numbered fragments the author can paste, the pipeline Sink
+/// block carrying the body Sink's compiled configuration rendered back to
+/// YAML, with the columns of a Sink that writes only emitted columns written
+/// out as its `mapping:`. A call carries only the rows of its composition's
+/// first declared output port, and only when nothing else in the body reads
+/// that port's node (#1315), so the move is offered only for a
+/// pipeline-level call, made once, whose body Sink reads the plain node
+/// behind that first port and shares it with no other body node, and whose
+/// columns a `mapping:` can state. Everywhere else the help is one next step,
+/// the explain page, with the reason.
+///
+/// Every help is written as if every movable Sink moves, so applying them
+/// all gives one consistent pipeline: new ports and pipeline Sink names take
+/// the Sink's name, or that name with the first free `_2`, `_3`, ... when
+/// it is already used (by an existing output or pipeline node, or by an
+/// earlier move), and a port count is the count after every move.
+///
+/// The caller runs this only when a Source declares document granularity;
+/// `source` names the first such Source in declaration order. The walk
+/// starts at the pipeline's composition calls and descends through each
+/// body's nested calls, so a Sink at any depth is reached through the call
+/// that owns it. Returns one diagnostic per body Sink, in that walk's order.
+pub(crate) fn diagnose_document_dlq_body_sinks(
+    dag: &ExecutionPlanDag,
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    signatures: &crate::config::composition::CompositionSymbolTable,
+    source: &str,
+) -> Vec<clinker_core_types::Diagnostic> {
+    use clinker_core_types::QuoteName;
+    use clinker_core_types::{Diagnostic, LabeledSpan};
+    use petgraph::Direction;
+
+    type BodyId = crate::plan::composition_body::CompositionBodyId;
+    /// A body Sink: the body that declares it and its node there.
+    type BodySink = (BodyId, NodeIndex);
+
+    /// The composition node that binds a body: its name and span, and the
+    /// body that contains it (`None` for a call in the pipeline itself).
+    struct Call<'a> {
+        name: &'a str,
+        span: clinker_core_types::Span,
+        parent: Option<BodyId>,
+    }
+
+    /// A movable Sink's names: its new port, the node that port reads, and
+    /// its name at pipeline level.
+    struct Move<'a> {
+        port: String,
+        port_node: &'a str,
+        pipeline_name: String,
+    }
+
+    fn collect_calls<'a>(
+        graph: &'a DiGraph<PlanNode, PlanEdge>,
+        parent: Option<BodyId>,
+        out: &mut HashMap<BodyId, Call<'a>>,
+    ) {
+        for node in graph.node_weights() {
+            if let PlanNode::Composition {
+                name, span, body, ..
+            } = node
+            {
+                out.insert(
+                    *body,
+                    Call {
+                        name,
+                        span: *span,
+                        parent,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Every Sink under `body_id`: its own Sinks and those of the
+    /// compositions it calls, in body node order, a nested call's Sinks at
+    /// the call's position.
+    fn body_sinks(
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        body_id: BodyId,
+        out: &mut Vec<BodySink>,
+    ) {
+        let Some(body) = artifacts.composition_bodies.get(&body_id) else {
+            return;
+        };
+        for idx in body.graph.node_indices() {
+            match &body.graph[idx] {
+                PlanNode::Sink { .. } => out.push((body_id, idx)),
+                PlanNode::Composition { body: nested, .. } => body_sinks(artifacts, *nested, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// `name`, or `name` with the first free numeric suffix, recorded as
+    /// taken. One rule for ports and pipeline Sink names.
+    fn free_name(name: &str, taken: &mut HashSet<String>) -> String {
+        let mut candidate = name.to_owned();
+        let mut suffix = 1;
+        while taken.contains(&candidate) {
+            suffix += 1;
+            candidate = format!("{name}_{suffix}");
+        }
+        taken.insert(candidate.clone());
+        candidate
+    }
+
+    let mut calls = HashMap::new();
+    collect_calls(&dag.graph, None, &mut calls);
+    for (body_id, body) in &artifacts.composition_bodies {
+        collect_calls(&body.graph, Some(*body_id), &mut calls);
+    }
+
+    // Every body Sink, reached from the pipeline's calls in node order.
+    let mut sinks = Vec::new();
+    for node in dag.graph.node_weights() {
+        if let PlanNode::Composition { body, .. } = node {
+            body_sinks(artifacts, *body, &mut sinks);
+        }
+    }
+
+    // How many calls bind each composition file.
+    let mut uses: HashMap<&std::path::Path, usize> = HashMap::new();
+    for (body_id, body) in &artifacts.composition_bodies {
+        if calls.contains_key(body_id) {
+            *uses.entry(body.signature_path.as_path()).or_default() += 1;
+        }
+    }
+
+    // Why a body Sink cannot be moved through a port today: the node behind
+    // the first port when it can, the reason when it cannot.
+    let movable = |(body_id, idx): BodySink| -> Result<&str, String> {
+        let body = &artifacts.composition_bodies[&body_id];
+        let call = &calls[&body_id];
+        let quoted_call = call.name.quoted_name();
+        if call.parent.is_some() {
+            return Err(format!(
+                "composition {quoted_call} is called inside another composition"
+            ));
+        }
+        let count = uses
+            .get(body.signature_path.as_path())
+            .copied()
+            .unwrap_or(0);
+        if count > 1 {
+            return Err(format!(
+                "`{file}` is used by {count} composition calls, so the moved Sink would be \
+                 declared once per call, each writing the same output",
+                file = composition_file_label(&body.signature_path),
+            ));
+        }
+        let Some((port, &port_node)) = body.output_port_to_node_idx.first() else {
+            return Err(format!(
+                "composition {quoted_call} declares no output port to carry the Sink's rows"
+            ));
+        };
+        let port_node_name = body.graph[port_node].name();
+        let reads = body
+            .graph
+            .neighbors_directed(idx, Direction::Incoming)
+            .next();
+        if reads != Some(port_node) {
+            let reads = reads.map_or("", |pred| body.graph[pred].name());
+            return Err(format!(
+                "Sink {quoted_sink} reads {quoted_reads}, and only the first output port of \
+                 composition {quoted_call}, `{port}` from {quoted_port_node}, carries rows to \
+                 the pipeline",
+                quoted_sink = body.graph[idx].name().quoted_name(),
+                quoted_reads = reads.quoted_name(),
+                quoted_port_node = port_node_name.quoted_name(),
+            ));
+        }
+        if let Some(input_port) = body
+            .port_name_to_node_idx
+            .iter()
+            .find_map(|(name, &node)| (node == port_node).then_some(name))
+        {
+            return Err(format!(
+                "the first output port of composition {quoted_call}, `{port}`, reads input \
+                 port {quoted_input} rather than a node of the composition",
+                quoted_input = input_port.quoted_name(),
+            ));
+        }
+        if matches!(body.graph[port_node], PlanNode::Composition { .. })
+            || body.graph[port_node].output_ports().is_some()
+        {
+            return Err(format!(
+                "the first output port of composition {quoted_call}, `{port}`, reads \
+                 {quoted_port_node}, which sends rows to output ports of its own, and a \
+                 composition output port cannot yet carry rows from one of those",
+                quoted_port_node = port_node_name.quoted_name(),
+            ));
+        }
+        if let Some(reader) = body
+            .graph
+            .neighbors_directed(port_node, Direction::Outgoing)
+            .find(|reader| !matches!(body.graph[*reader], PlanNode::Sink { .. }))
+        {
+            return Err(format!(
+                "{quoted_port_node} also feeds {quoted_reader} inside composition \
+                 {quoted_call}, and a composition output port cannot yet carry rows from a \
+                 node that another node in the composition reads",
+                quoted_port_node = port_node_name.quoted_name(),
+                quoted_reader = body.graph[reader].name().quoted_name(),
+            ));
+        }
+        if projected_columns(&body.graph, idx).is_some_and(|kept| kept.is_empty()) {
+            return Err(format!(
+                "Sink {quoted_sink} sets `include_unmapped: false` and its `exclude:` removes \
+                 every column {quoted_port_node} emits, so at pipeline level it would write \
+                 the columns composition {quoted_call} passes through instead",
+                quoted_sink = body.graph[idx].name().quoted_name(),
+                quoted_port_node = port_node_name.quoted_name(),
+            ));
+        }
+        Ok(port_node_name)
+    };
+
+    // Names for every move, in walk order: a port per composition and a
+    // pipeline Sink name, each free of what is already there and of earlier
+    // moves. A composition's taken set ends as every output its file declares
+    // after every move, so its size is the port count step 3 states.
+    let mut port_taken: HashMap<BodyId, HashSet<String>> = HashMap::new();
+    let mut sink_taken: HashSet<String> = dag
+        .graph
+        .node_weights()
+        .map(|node| node.name().to_owned())
+        .collect();
+    let mut decisions: Vec<(BodySink, Result<Move<'_>, String>)> = Vec::new();
+    for (body_id, idx) in sinks {
+        let decision = movable((body_id, idx)).map(|port_node| {
+            let body = &artifacts.composition_bodies[&body_id];
+            let sink = body.graph[idx].name();
+            // Every declared output name is taken, including one whose alias
+            // names no body node: bind drops that output, but its key stays
+            // under `_compose.outputs:`.
+            let ports = port_taken.entry(body_id).or_insert_with(|| {
+                body.output_port_to_node_idx
+                    .keys()
+                    .chain(
+                        signatures
+                            .get(&body.signature_path)
+                            .into_iter()
+                            .flat_map(|signature| signature.outputs.keys()),
+                    )
+                    .cloned()
+                    .collect()
+            });
+            Move {
+                port: free_name(sink, ports),
+                port_node,
+                pipeline_name: free_name(sink, &mut sink_taken),
+            }
+        });
+        decisions.push(((body_id, idx), decision));
+    }
+
+    let mut out = Vec::new();
+    for ((body_id, idx), decision) in decisions {
+        let body = &artifacts.composition_bodies[&body_id];
+        let call = &calls[&body_id];
+        let PlanNode::Sink {
+            name: sink,
+            span: sink_span,
+            resolved,
+            ..
+        } = &body.graph[idx]
+        else {
+            continue;
+        };
+        let quoted_sink = sink.quoted_name();
+        let quoted_call = call.name.quoted_name();
+        let help = match decision {
+            Err(reason) => format!(
+                "run `clinker explain --code E378` and follow its steps for declaring Sink \
+                 {quoted_sink} at pipeline level: moving it through a composition output port \
+                 does not work here, because {reason}"
+            ),
+            Ok(Move {
+                port,
+                port_node,
+                pipeline_name,
+            }) => {
+                let file = composition_file_label(&body.signature_path);
+                // The reference as authored; the port node is the same node.
+                let feeding = body
+                    .node_input_refs
+                    .get(sink)
+                    .and_then(|refs| refs.first().map(String::as_str))
+                    .unwrap_or(port_node);
+                let mut steps = vec![
+                    format!("in `{file}`, under `_compose.outputs:`, add:\n    {port}: {feeding}"),
+                    format!("in `{file}`, remove Sink {quoted_sink} from `nodes:`"),
+                ];
+                if let [only_port] = body
+                    .output_port_to_node_idx
+                    .keys()
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    steps.push(format!(
+                        "composition {quoted_call} then has {count} output ports, so read \
+                         `{call}.{only_port}` wherever the pipeline reads `{call}` without a port",
+                        count = port_taken.get(&body_id).map_or(0, HashSet::len),
+                        call = call.name,
+                    ));
+                }
+                // The Sink's own configuration, under its pipeline name. A
+                // Sink that writes only emitted columns gets them written out
+                // as its `mapping:`: in the body its input is the port node,
+                // which emits only those columns, but at pipeline level its
+                // input is the call, whose emitted columns are its whole
+                // output, pass-through columns included. A mapping under
+                // `include_unmapped: false` writes exactly the listed columns
+                // in the listed order, which is what the body Sink wrote.
+                let config = resolved.as_deref().map(|payload| {
+                    let mut config = payload.sink.clone();
+                    config.name.clone_from(&pipeline_name);
+                    if let Some(columns) = projected_columns(&body.graph, idx) {
+                        config.mapping = Some(crate::config::OutputMapping::new(
+                            columns
+                                .into_iter()
+                                .map(crate::config::MappingEntry::passthrough)
+                                .collect(),
+                        ));
+                    }
+                    config
+                });
+                steps.push(format!(
+                    "under the pipeline's `nodes:`, add:\n  - type: sink\n    name: \
+                     {pipeline_name}\n    input: {call}.{port}\n{config}",
+                    call = call.name,
+                    config = render_sink_config(config.as_ref(), sink),
+                ));
+                let renamed = if pipeline_name == *sink {
+                    String::new()
+                } else {
+                    format!(
+                        ", as Sink {quoted} because {quoted_sink} is taken there,",
+                        quoted = pipeline_name.quoted_name()
+                    )
+                };
+                let mut help = format!(
+                    "move Sink {quoted_sink} to the pipeline{renamed} and feed it through a new \
+                     output port of composition {quoted_call}, so it writes only after every \
+                     document's verdict is final",
+                );
+                for (number, step) in steps.iter().enumerate() {
+                    help.push_str(&format!("\n{}. {step}", number + 1));
+                }
+                help
+            }
+        };
+        let message = format!(
+            "composition {quoted_call} declares Sink {quoted_sink} in its body, but \
+             source {quoted_source} declares `dlq_granularity: document`, which needs \
+             every Sink declared at pipeline level",
+            quoted_source = source.quoted_name(),
+        );
+        out.push(
+            Diagnostic::error(
+                "E378",
+                message,
+                LabeledSpan::primary(*sink_span, "Sink declared inside a composition body"),
+            )
+            .with_secondary(LabeledSpan::primary(call.span, "composition invoked here"))
+            .with_help(help),
+        );
+    }
+    out
+}
+
+/// A composition file as the help names it: its workspace-relative path with
+/// `/` between components, the form a `use:` line spells on every platform.
+fn composition_file_label(path: &std::path::Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The columns a body Sink restricts its output to, where the moved Sink
+/// would not restrict itself to the same ones, in the order it writes them;
+/// `None` when the moved Sink, with the body Sink's configuration unchanged,
+/// writes what the body Sink wrote.
+///
+/// A Sink with `include_unmapped: false` and no `mapping:` writes only the
+/// columns its input emits ([`cxl_emit_walk`], the walk the runtime
+/// projection reads), less the names its `exclude:` lists, in the order the
+/// record carries them, which is the emit walk's schema order. Only a walk
+/// that ends at a Transform reports fewer columns than the row the
+/// composition call passes on: the call's own emit names are its whole
+/// output schema, so the moved Sink would also write the columns the
+/// Transform passes through. Every other end already reports the whole row
+/// the port carries, engine-stamped columns included, which the runtime
+/// projection never writes, so the unchanged configuration writes the same
+/// columns and no `mapping:` is needed (one would name those engine columns,
+/// written as empty cells). An input that emits no named column applies no
+/// restriction at runtime, so it is `None` here too. `Some` of an empty list
+/// is a Sink whose `exclude:` removes every column a Transform emits.
+fn projected_columns(graph: &DiGraph<PlanNode, PlanEdge>, idx: NodeIndex) -> Option<Vec<String>> {
+    let PlanNode::Sink { resolved, .. } = &graph[idx] else {
+        return None;
+    };
+    let sink = &resolved.as_deref()?.sink;
+    if sink.include_unmapped || sink.mapping.is_some() {
+        return None;
+    }
+    let (end, emitted) = cxl_emit_walk(graph, idx)?;
+    if !matches!(graph[end], PlanNode::Transform { .. }) || emitted.is_empty() {
+        return None;
+    }
+    let excluded = sink.exclude.as_deref().unwrap_or_default();
+    Some(
+        emitted
+            .into_iter()
+            .filter(|column| !excluded.contains(column))
+            .collect(),
+    )
+}
+
+/// The `config:` lines of a pipeline Sink block: the body Sink's compiled
+/// configuration rendered back to YAML, indented under `config:`.
+///
+/// Every lowered Sink carries its configuration and a `SinkConfig` always
+/// serializes, so the fallback is reached only if lowering changes shape; it
+/// says in words where to copy the block from rather than print YAML that
+/// would not compile.
+fn render_sink_config(sink: Option<&crate::config::SinkConfig>, name: &str) -> String {
+    use clinker_core_types::QuoteName;
+    let Some(Ok(rendered)) = sink.map(crate::yaml::to_string) else {
+        return format!(
+            "    config: copy the `config:` block of Sink {quoted} from the composition file \
+             unchanged",
+            quoted = name.quoted_name()
+        );
+    };
+    let mut block = String::from("    config:");
+    for line in rendered.lines().filter(|line| !line.trim().is_empty()) {
+        block.push_str("\n      ");
+        block.push_str(line);
+    }
+    block
+}
+
 /// Extract the cycle path from a DFS back-edge detection.
 ///
 /// Uses `depth_first_search` with `DfsEvent::BackEdge` + predecessor map
