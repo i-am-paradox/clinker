@@ -70,8 +70,9 @@ Reshape groups a record under a single **null group** whenever it cannot build a
 - the column being absent from the record
 - an explicit null
 - an **empty string** (`""`)
-- a `NaN` float
 - an array- or map-valued cell (a multi-value column)
+
+A `NaN` float, of either sign, is one group of its own, not part of the null group. Numbers group by exact value, as in [Aggregate](aggregate.md#group-by-fields): `1`, `1.0` and the decimal `1` are one group, and distinct integers never merge, however large.
 
 So `account=""` and `account=null` land in the *same* Reshape group. Note that [Cull](cull.md#values-cull-cannot-key) does **not** fold empty strings — there, `account=""` and `account=null` are two groups. The difference is unintentional and tracked in [#1022](https://github.com/rustpunk/clinker/issues/1022); until it is resolved, do not assume one node's grouping matches the other's for blank values.
 
@@ -79,7 +80,34 @@ If a blank-heavy column is your partition key, expect one large null group. Norm
 
 ## `order_by`
 
-Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before rules run, so order-dependent synthesis is deterministic. Nulls sort last. Arrival order breaks ties.
+Optional. A list of sort fields applied within each group before rules run, so order-dependent synthesis is deterministic. Arrival order breaks ties.
+
+Each entry is either a field name, which sorts ascending, or a map `{ field, order, null_order }`:
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `field` | a column of the input | required |
+| `order` | `asc` or `desc` | `asc` |
+| `null_order` | `first` or `last` | `last` |
+
+```yaml
+order_by:
+  - plan_start                                  # same as { field: plan_start }
+  - { field: plan_end, order: desc, null_order: first }
+```
+
+Each group is ordered this way before its rules run, exactly as a Sink `sort_order` orders rows (see [How values are ordered](sink.md#how-values-are-ordered)): a null goes where `null_order` puts it, `last` by default for `asc` and `desc` alike; numbers compare by their exact value across integers, floats and decimals; every `NaN` is one value after every number, and so comes first under `desc`; `-0.0` equals `0.0`; and rows the order calls equal keep their arrival order.
+
+`null_order: drop` is rejected when the pipeline is planned. `order_by` only arranges the rows of a group; it never removes any. To leave out rows whose field is null, filter them in a Transform before the Reshape:
+
+```yaml
+- type: transform
+  name: started_only
+  input: plans
+  config:
+    cxl: |
+      filter not plan_start.is_null()
+```
 
 ## Rules
 

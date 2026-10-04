@@ -44,6 +44,7 @@ storage/resolver traits.
 - `schema_def`: schema-file and inline schema structures.
 - `storage`, `record_view`, `resolver`: zero-copy storage and field/window resolution contracts.
 - `document_context`: `$doc` envelope records, document ids/grains, synthetic context, and spill codec.
+- `order`: the one value order — `compare`, the memcomparable `encode` and per-domain `encode_*`, `ties`, `NumericTieClass` and `hash_tie_class`; pure functions, no retained state.
 - `provenance`, `group_key`, `accumulator`, `counters`, `coercion`, `minimal`: focused data-model helpers.
 
 ## Dependency rules
@@ -77,7 +78,7 @@ Current dev/bench dependencies are expected only for tests and benches:
   identity remains its separate `Arc<str>`.
 - `DocumentGrain` is the output-envelope frame identity, not always the innermost document id.
 - `FieldMetadata` marks engine-stamped columns; default user-field iteration skips stamped columns.
-- Group keys canonicalize default integers/floats together, reject NaN, and treat null as caller-controlled.
+- Group keys are the value order's ties: integers key exactly (no float widening), equal numbers of different types are one key, every NaN is one key, and null is caller-controlled. `GroupByKey` equality, hashing and `encode_tie_bytes` must stay in step with `order`.
 - Accumulator finalize must surface overflow via `AccumulatorError`, not wrapping casts.
 - Crate-local guidance is most relevant for broad changes to `Value`, `Record`, schema, provenance, document context, storage, accumulator, or counter semantics.
 

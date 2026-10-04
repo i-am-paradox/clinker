@@ -57,18 +57,47 @@ Cull groups a record under a single **null group** in two cases: the column is a
 Everything else is either its own group or a hard error:
 
 - An **empty string** (`""`) is its own group, distinct from `account=null`.
-- A `NaN` float, or an array- or map-valued cell, **aborts the run** rather than grouping — a partition key must be a single scalar value. This abort currently presents as an *internal error*, but it is a data condition, not an engine defect: fix the offending column rather than treating the message as an engine invariant failure.
+- Numbers group by exact value, as in [Aggregate](aggregate.md#group-by-fields): `1`, `1.0` and the decimal `1` are one group, and distinct integers never merge, however large.
+- A `NaN` float, of either sign, is one group of its own, distinct from the null group.
+- An array- or map-valued cell **aborts the run** rather than grouping — a partition key must be a single scalar value. This abort currently presents as an *internal error*, but it is a data condition, not an engine defect: fix the offending column rather than treating the message as an engine invariant failure.
 
-[Reshape](reshape.md#values-reshape-cannot-key) treats both of those differently:
-it folds empty strings, NaNs, and multi-value cells all into its null group
-instead. The blank-versus-null divergence is tracked in
-[#1022](https://github.com/rustpunk/clinker/issues/1022). The unkeyable-value
+[Reshape](reshape.md#values-reshape-cannot-key) treats empty strings and
+multi-value cells differently: it folds both into its null group instead. The
+blank-versus-null divergence is tracked in
+[#1022](https://github.com/rustpunk/clinker/issues/1022). The multi-value
 behavior is separate; until both rules are deliberately aligned or retained,
 do not assume one node's grouping matches the other's.
 
 ## `order_by`
 
-Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before its predicate runs, so an order-sensitive predicate is deterministic. Nulls sort last. Arrival order breaks ties.
+Optional. A list of sort fields that orders the rows of each group as they are written. It does not change which groups are removed: the removal rule is evaluated over the group in arrival order ([#1264](https://github.com/rustpunk/clinker/issues/1264)). Arrival order breaks ties.
+
+Each entry is either a field name, which sorts ascending, or a map `{ field, order, null_order }`:
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `field` | a column of the input | required |
+| `order` | `asc` or `desc` | `asc` |
+| `null_order` | `first` or `last` | `last` |
+
+```yaml
+order_by:
+  - txn_date                                    # same as { field: txn_date }
+  - { field: amount, order: desc, null_order: first }
+```
+
+A group's rows are ordered exactly as a Sink `sort_order` orders rows (see [How values are ordered](sink.md#how-values-are-ordered)): a null goes where `null_order` puts it, `last` by default for `asc` and `desc` alike; numbers compare by their exact value across integers, floats and decimals; every `NaN` is one value after every number, and so comes first under `desc`; `-0.0` equals `0.0`; and rows the order calls equal keep their arrival order.
+
+`null_order: drop` is rejected when the pipeline is planned. `order_by` only arranges the rows of a group; it never removes any, and every record of a group is kept or removed together. To leave out rows whose field is null, filter them in a Transform before the Cull:
+
+```yaml
+- type: transform
+  name: dated_only
+  input: transactions
+  config:
+    cxl: |
+      filter not txn_date.is_null()
+```
 
 ## Rules
 

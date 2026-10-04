@@ -4,6 +4,87 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — Cull and Reshape order each group like a Sink sort
+
+A Cull or Reshape `order_by` now orders the rows of each group by the same
+rule a Sink `sort_order` uses (see
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered)),
+and applies the `null_order` written there, `last` by default for `asc` and
+`desc` alike. Output changes where a group's ordering key holds:
+
+- **A null under `desc`, or with `null_order` omitted.** Nulls came first
+  under `desc`; they now come last unless the field says
+  `null_order: first`.
+- **An authored `null_order: first`.** It was accepted and then ignored; it
+  now places the nulls.
+- **NaN, `-0.0`, and a column mixing integers with floats or decimals.** An
+  integer and a float used to compare as equal, and a NaN could stop the
+  comparison, so the rows around them came out in no fixed order. They now
+  take their place in the value order.
+
+Closes [#1281](https://github.com/rustpunk/clinker/issues/1281).
+
+### Changed — null_order: drop is accepted only on a Sink sort_order
+
+`null_order: drop` excludes records whose key is null, which only a Sink's
+`sort_order` is for. On a field that only orders records it is now refused
+when the pipeline is planned, with the reason and one fix: delete
+`null_order: drop` and add a Transform whose whole `config` is the printed
+`config: { cxl: "filter not <field>.is_null()" }` line, before the node, or
+after a Source. Node and field names print in double quotes, escaped as in
+every other diagnostic:
+
+- **Cull and Reshape `order_by`.** `drop` used to be accepted and silently
+  ignored. It is now an E200 error naming the node and the field:
+
+  ```text
+  cull "dedupe": `null_order: drop` is not allowed on `order_by` for field "txn_date": `order_by` only orders the rows of a group, placing nulls `first` or `last`, and cannot remove a row. To remove the rows whose "txn_date" is null, delete `null_order: drop` and add a Transform before this node with `config: { cxl: "filter not txn_date.is_null()" }`.
+  ```
+
+- **Source `sort_order`.** `drop` was already refused; the error now also
+  gives the fix, the printed filter Transform after the Source, and is
+  reported as E200 at the Source like the other ordering-only fields (it used
+  to be an E003 "node property derivation failed" error with no location).
+- **Transform `analytic_window.sort_by`.** `drop` used to silently take
+  null-key rows out of the window partition, so the window functions never
+  saw them, while the Transform still wrote those rows. It is now an E200
+  error at the Transform, and `null_order` there is `first` or `last` only.
+  To leave those rows out, filter them in a Transform before the windowed
+  one; unlike the old behaviour, that also removes them from its output:
+
+  ```text
+  transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field "amount": `sort_by` only orders the rows of a window partition, placing nulls `first` or `last`, and cannot remove a row. To remove the rows whose "amount" is null, delete `null_order: drop` and add a Transform before this node with `config: { cxl: "filter not amount.is_null()" }`.
+  ```
+
+  Two windows that differ only in `null_order` now each read partitions in
+  their own order; they used to share one index sorted by whichever came
+  first.
+
+The filter is printed only for a field CXL can name as it is: one identifier
+of ASCII letters, digits and `_`, not starting with a digit and not a CXL
+keyword. For any other field, such as `order id`, `filter` or a flattened
+`Address.City`, the error prints no CXL, since that text would not parse or,
+for a dotted name, would read another value and drop every row. Its one
+next step is the `source_name:` line it prints for that column: in the
+column's Source schema entry, set `name` to a new identifier and add that
+line, then use the new name wherever the pipeline names the column. Planning
+again prints the filter on the new name:
+
+```text
+source "orders": `null_order: drop` is not allowed on `sort_order` for field "order id": a Source `sort_order` only states the order its records arrive in, placing nulls `first` or `last`, and verifying it cannot discard a record. To remove the rows whose "order id" is null, first give the column a name CXL can write: in its Source schema entry, set `name` to a new identifier and add `source_name: "order id"`, then use the new name wherever the pipeline names this column; planning again prints the filter to add. A CXL name is one identifier of ASCII letters, digits and `_`, not starting with a digit and not a CXL keyword.
+```
+
+Cull and Reshape `order_by` also accept a bare field name, as a Sink or
+Source `sort_order` does: `order_by: [txn_date]` is
+`order_by: [{ field: txn_date }]`.
+
+For Rust callers, `validate_source_sort_policy` returns the validated fields
+(`Vec<OrderField>`) instead of `()`, and `PlanNode::Cull` and
+`PlanNode::Reshape` carry the validated `order_by: Vec<OrderField>`. The
+window index types (`RawIndexRequest`, `IndexSpec`, `find_index_for`) and
+`pipeline::sort::{sort_partition, is_sorted}` take `OrderField`s, and
+`sort_partition` takes the positions as `&mut [u64]`.
+
 ### Fixed — a rejected document's rows are dead-lettered once under `dlq_granularity: document`, and no held row is lost
 
 Under `dlq_granularity: document`, a Sink could write a document's records
@@ -157,6 +238,68 @@ run wrote.
 - Under a key, `dlq_count`, `records_dlq` and the `dlq.max_rate` numerators
   therefore rise to the counts the same failures give without a key, plus
   the rows the failing groups condemn.
+
+### Changed — records group by exact numeric value, and NaN is one group
+
+Every place that puts records into groups now decides whether two values
+are the same group by the rule sorting uses (see
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered)):
+Aggregate `group_by`, Cull and Reshape `partition_by`, a window's `group_by`,
+correlation keys, `distinct` and output splitting. Output changes where a
+group key holds:
+
+- **Integers above 2^53.** Distinct integers are distinct groups however
+  large. Integers used to be grouped through a float, so neighbours such as
+  `9007199254740992` and `9007199254740993` merged into one group.
+- **An integer and a decimal of equal value** are one group, as an integer
+  and a float of equal value already were. They used to be two groups.
+- **Negative zero.** `-0.0` and `0.0` remain one group.
+- **NaN.** Every NaN key, whatever its sign, is one group, separate from the
+  null group. A NaN key used to stop the run in Aggregate, Cull, window
+  partitions and output splitting; to fail the record in `distinct`, handled
+  like any other evaluation error under `error_handling`; and to join the
+  null group in Reshape and in correlation keys.
+- **The written group value.** A group reports the value of its first-arriving
+  row, the same with or without spilling to disk. An integer group-by column is
+  now written as integers (JSON `42` where it was `42.0`), and integers above
+  2^53 are written exactly where they were rounded. A column that holds both
+  integers and floats writes each group as its first row held it.
+- **Session-window Aggregates.** A session-window Aggregate grouped by an
+  integer column, or by a column holding integers among other numbers,
+  writes its groups in a different order than before. The order is the same
+  on every run, but it is not the value order: a group keyed `10` can be
+  written before one keyed `9`. Session groups are written in key order in a
+  later release.
+
+Reshape still puts empty strings and array- or map-valued cells in its null
+group, unlike Cull
+([#1022](https://github.com/rustpunk/clinker/issues/1022)).
+
+### Fixed — sorting places NaN, negative zero and mixed numbers by one rule
+
+A Sink or Source `sort_order` and a window's `sort_by` now order every value
+by one rule, described in
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered).
+Output changes where a sort key holds:
+
+- **NaN.** Every NaN, whatever its sign, is one value that sorts after `inf`
+  in ascending order and first in descending order. A NaN used to compare
+  equal to every value, which made it a barrier: the records around it could
+  be left unsorted, and the output could depend on the memory limit, because a
+  sort that spilled to disk split the records at different places.
+- **Negative zero.** `-0.0` and `0.0` are equal, so they keep their arrival
+  order.
+- **Integers, floats and decimals in one column.** They compare by exact
+  value: the integer `9007199254740993` sorts after the float
+  `9007199254740992.0`, and an integer and a decimal of equal value are equal.
+  A sort that spilled to disk used to compare an integer with a float by raw
+  bytes of different meaning.
+- **Values of different types in one column** order by a fixed rank: booleans,
+  numbers, strings, dates, datetimes, arrays, maps. They used to compare equal.
+- **Leap seconds.** A leap-second datetime sorts with the instant one second
+  later, as a sort that spilled to disk already did.
+
+Nulls are still placed only by `null_order`.
 
 ### Changed — terminal Output nodes are now Sinks
 

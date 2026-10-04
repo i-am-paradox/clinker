@@ -891,6 +891,46 @@ landed. Runtime admission still rejects unresolved `numeric` with E158.)
   a compile-time error instead of a silent null.
 - Implementation owner: CXL and executor maintainers.
 
+## Language surface findings
+
+### 89. CXL cannot name a field whose name is not a plain identifier, so some suggested fixes do not paste
+
+- Filed: 2026-09-29.
+- Status: Open; decided, interim landed, full feature not built.
+- Decision: D-106 (a backtick-quoted field-name segment, dotted CXL paths
+  resolved as column paths, and one shared helper that renders any column name
+  as CXL) and D-108 (the interim below until D-106 lands).
+- Interim (D-108, landed): `cxl::lexer::is_bare_field_name` decides whether a
+  column can be written in CXL as it is, using the lexer's own keyword table
+  (`cxl::lexer::KEYWORDS`). When it cannot, the refused-`null_order: drop`
+  message prints no CXL and points at the Source schema's `source_name`
+  rename; a plain field keeps the paste-able filter. The check is deleted when
+  D-106 lands and every suggested fix renders through the shared helper.
+- Priority: Medium.
+- Evidence: the CXL lexer (`crates/cxl/src/lexer.rs`, `lex_ident`) reads a
+  field reference only as `[A-Za-z_][A-Za-z0-9_]*`, and a word in its keyword
+  table (`filter`, `in`, `by`, `it`, `now`, `null`, and others) is never a
+  field reference. There is no quoted or escaped form: a quoted token is a
+  string literal, and `$record.<key>` is declared per-record state, not the
+  input row. A source schema may still declare a column such as `order id`:
+  a pipeline declaring one compiles, but the row cannot be filtered on that
+  field from CXL at all. Before the interim, every refused `null_order: drop`
+  (`DropNotAllowed` in `crates/clinker-plan/src/config/sort.rs`) suggested
+  `filter not <field>.is_null()` with the field written as-is: for `order id`
+  a filter that does not parse, and for a flattened `Address.City` one that
+  parses as a path and reads null (dropping every row) or another column's
+  value.
+- Files/modules involved: `crates/cxl/src/lexer.rs`,
+  `crates/cxl/src/parser.rs` (`parse_atom`), the `DropNotAllowed` message in
+  `crates/clinker-plan/src/config/sort.rs`, and source schema validation.
+- Suggested way to resolve it: build D-106: the quoted field-reference form,
+  schema-resolved dotted paths (which also settles #995 and the read side of
+  #400), and suggested fixes rendered through the shared helper. Rejecting
+  such columns, a generic row accessor and ingest normalization were
+  considered and rejected.
+- Implementation owner: Phase 4 (authoring surface) or an inserted 04.x
+  phase; CXL language maintainers.
+
 ## Resolved Archive
 
 ### 61. Decoded allocation ownership

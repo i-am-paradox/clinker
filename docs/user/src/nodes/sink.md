@@ -573,6 +573,17 @@ Sort records before writing:
 - `last` -- nulls sort after all non-null values.
 - `drop` -- records with null sort keys are excluded from output.
 
+`drop` is available only on a Sink `sort_order`, because only a Sink's
+ordering decides which records are written. A Source `sort_order`, a Cull or
+Reshape `order_by` and a Transform `analytic_window.sort_by` only order
+records, so they accept `first` and `last` and reject `drop` when the
+pipeline is planned, pointing at a `filter not <field>.is_null()` Transform
+instead. When CXL cannot name the field as it is (a name with a space, a CXL
+keyword such as `filter`, or a flattened `Address.City`), the error prints no
+CXL and points at the Source schema's
+[`source_name`](source.md#source_name--read-a-differently-named-physical-column)
+rename, which gives the column a name the filter can use.
+
 `drop` removes records, so a run using it writes fewer records than it read
 and that is not a fault. A missing column counts as a null key: a record that
 never carried the sort field is dropped the same as one carrying an explicit
@@ -630,6 +641,36 @@ different arrival orders, equal-key rows have no cross-strategy relative-order
 promise. Author enough fields for a total business order before using an exact
 byte comparison; otherwise validate the decoded record multiset and aggregate
 values instead.
+
+### How values are ordered
+
+Every sort uses one rule for comparing two values: a Sink or Source
+`sort_order`, a Cull or Reshape `order_by`, a window's `sort_by`, and the
+check that verifies a Source's declared order. The rule does not depend on the memory limit, so a sort that
+spills to disk writes the same records in the same order as one that fits in
+memory.
+
+- **Nulls** are placed only by `null_order`: first, last or dropped. A missing
+  column counts as a null.
+- **Values of one type** order naturally: numbers by value, strings by UTF-8
+  code point (no locale collation, so `"Z"` sorts before `"a"`), `false` before
+  `true`, and dates and datetimes chronologically. A leap-second datetime sorts
+  with the instant one second later that has the same fraction.
+- **Integers, floats and decimals** compare by their exact value, not through
+  a rounded floating-point copy. The integer `1`, the float `1.0` and the
+  decimal `1.00` are equal. The integer `9007199254740993` sorts after the
+  float `9007199254740992.0`, although the two round to the same float. The
+  decimal `0.1` sorts before the float `0.1`, whose exact binary value is
+  slightly larger.
+- **Zero** has one position: `-0.0` and `0.0` are equal.
+- **NaN** is one value, whatever its sign. It sorts after every number,
+  `inf` included, in ascending order, and so comes first in descending order.
+- **Values of different types**, which a column can hold when an expression's
+  branches produce different types, order by type: booleans, then numbers,
+  then strings, then dates, then datetimes, then arrays, then maps.
+
+Values the rule calls equal keep their arrival order, as described above, at
+every memory limit.
 
 ### Physical writer boundaries
 

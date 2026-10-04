@@ -283,7 +283,9 @@ planner can admit order-dependent strategies such as streaming aggregation:
 ```
 
 Clinker binds these fields to the declared source schema, compares the typed
-values, and verifies each physical file independently before any record from
+values by the same rule every sort uses (see
+[How values are ordered](sink.md#how-values-are-ordered)), and verifies each
+physical file independently before any record from
 that file reaches an order-dependent consumer. The declaration never means
 that a multi-file source is globally sorted: the last key in one file is not
 compared with the first key in the next file.
@@ -303,7 +305,20 @@ compared with the first key in the next file.
 ```
 
 Source ordering accepts `null_order: first` or `last`; `drop` is rejected
-because verifying order must not discard source records. Equal authored keys
+when the pipeline is planned because verifying order must not discard source
+records. The error gives one fix: delete `null_order: drop` and add a
+Transform after the Source whose whole `config` is the line it prints,
+`config: { cxl: "filter not <field>.is_null()" }`. With the line deleted, the
+Source declares its null keys `last`; if a file's null keys arrive first,
+write `null_order: first` instead of deleting the line. That filter needs a
+field CXL can name as it is: one identifier of ASCII letters, digits and `_`,
+not starting with a digit and not a CXL keyword. For any other key, such as
+`order id`, `filter` or a flattened `Address.City`, the error prints no CXL
+and prints a [`source_name`](#source_name--read-a-differently-named-physical-column)
+line for the column instead, such as `source_name: "order id"`. Set the
+column's `name` to a new identifier, add that line, use the new name wherever
+the pipeline names the column, and plan again: the error then prints the
+filter on the new name. Equal authored keys
 retain arrival order within the selected execution path. Clinker does not add
 a source identity, physical filename, or canonical-row tie-breaker.
 

@@ -12,7 +12,7 @@ use clinker_record::Schema;
 use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
 
-use crate::config::SortField;
+use crate::config::{OrderField, SortField};
 
 /// Where a window's secondary index is rooted in the execution plan.
 ///
@@ -98,7 +98,10 @@ pub struct AnalyticWindowSpec {
     pub source: Option<String>,
     /// Fields to group the partition by.
     pub group_by: Vec<String>,
-    /// Fields to sort the partition by (within each group).
+    /// Fields to sort the partition by (within each group), as authored.
+    /// Schema binding validates them into placement-only
+    /// [`OrderField`]s, refusing `null_order: drop`; the index requests are
+    /// built from those.
     #[serde(default)]
     pub sort_by: Vec<SortField>,
     /// Expression to evaluate against the primary record for cross-source lookup.
@@ -122,8 +125,9 @@ pub struct IndexSpec {
     pub root: PlanIndexRoot,
     /// Fields to group partition keys by.
     pub group_by: Vec<String>,
-    /// Fields to sort within each partition.
-    pub sort_by: Vec<SortField>,
+    /// Fields to sort within each partition. Placement-only: the partition
+    /// sort orders every row it is given and removes none.
+    pub sort_by: Vec<OrderField>,
     /// All fields the Arena must store for this index: union of group_by + sort_by + window-referenced.
     pub arena_fields: Vec<String>,
     /// True if the source config declares a sort_order matching this index's sort_by.
@@ -186,7 +190,9 @@ pub fn deduplicate_indices(raw_specs: Vec<RawIndexRequest>) -> Vec<IndexSpec> {
 pub struct RawIndexRequest {
     pub root: PlanIndexRoot,
     pub group_by: Vec<String>,
-    pub sort_by: Vec<SortField>,
+    /// The window's validated `sort_by`: it places nulls and never removes
+    /// a row.
+    pub sort_by: Vec<OrderField>,
     pub arena_fields: Vec<String>,
     pub already_sorted: bool,
     /// Index of the transform that requested this index.
@@ -223,7 +229,7 @@ pub fn find_index_for(
     indices: &[IndexSpec],
     root: &PlanIndexRoot,
     group_by: &[String],
-    sort_by: &[SortField],
+    sort_by: &[OrderField],
 ) -> Option<usize> {
     indices.iter().position(|spec| {
         &spec.root == root
@@ -232,11 +238,70 @@ pub fn find_index_for(
     })
 }
 
-fn sort_fields_equal(a: &[SortField], b: &[SortField]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Whether two windows order their partitions identically: the same fields,
+/// directions and null placements. Dedup and lookup share this one test, so
+/// a window never finds an index sorted with another window's placement.
+fn sort_fields_equal(a: &[OrderField], b: &[OrderField]) -> bool {
+    a == b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{NullPlacement, SortOrder};
+    use std::sync::Arc;
+
+    fn root() -> PlanIndexRoot {
+        PlanIndexRoot::Node {
+            upstream: NodeIndex::new(0),
+            anchor_schema: SharedStorage::from_arc(Arc::new(Schema::new(vec![
+                "dept".into(),
+                "amount".into(),
+            ]))),
+        }
     }
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| x.field == y.field && x.order == y.order)
+
+    fn amount(null_order: NullPlacement) -> Vec<OrderField> {
+        vec![OrderField {
+            field: "amount".into(),
+            order: SortOrder::Asc,
+            null_order,
+        }]
+    }
+
+    fn request(transform_index: usize, sort_by: Vec<OrderField>) -> RawIndexRequest {
+        RawIndexRequest {
+            root: root(),
+            group_by: vec!["dept".into()],
+            sort_by,
+            arena_fields: vec!["amount".into(), "dept".into()],
+            already_sorted: false,
+            transform_index,
+            requires_buffer_recompute: false,
+        }
+    }
+
+    /// Two windows that differ only in where nulls go need two indices:
+    /// one shared index is sorted one way, and the other window would read
+    /// its partitions in an order its author did not write.
+    #[test]
+    fn windows_differing_only_in_null_order_get_separate_indices() {
+        let first = amount(NullPlacement::First);
+        let last = amount(NullPlacement::Last);
+        let indices = deduplicate_indices(vec![
+            request(0, first.clone()),
+            request(1, last.clone()),
+            request(2, last.clone()),
+        ]);
+        assert_eq!(indices.len(), 2, "got {indices:?}");
+
+        let group_by = vec!["dept".to_string()];
+        let first_index = find_index_for(&indices, &root(), &group_by, &first)
+            .expect("the nulls-first window finds an index");
+        let last_index = find_index_for(&indices, &root(), &group_by, &last)
+            .expect("the nulls-last window finds an index");
+        assert_ne!(first_index, last_index);
+        assert_eq!(indices[first_index].sort_by, first);
+        assert_eq!(indices[last_index].sort_by, last);
+    }
 }

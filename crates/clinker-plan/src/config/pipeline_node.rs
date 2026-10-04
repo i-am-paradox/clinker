@@ -1877,8 +1877,13 @@ pub struct ReshapeBody {
     pub partition_by: Vec<String>,
     /// Optional within-group ordering. When set, each group's rows are
     /// sorted by these keys before rules run, so `order_by`-dependent
-    /// synthesis (e.g. copy-from-first) is deterministic.
-    #[serde(default)]
+    /// synthesis (e.g. copy-from-first) is deterministic. Each entry is a
+    /// field name or a full sort field; binding validates the list into
+    /// placement-only fields, refusing `null_order: drop`.
+    #[serde(
+        default,
+        deserialize_with = "crate::config::sort::deserialize_sort_field_list"
+    )]
     pub order_by: Vec<crate::config::SortField>,
     /// Declarative rules applied per group. Evaluated in declaration
     /// order, but all against the same original group snapshot.
@@ -1957,10 +1962,16 @@ pub struct CullBody {
     /// Correlation-key fields. Records are grouped by the tuple of these
     /// column values; every rule's predicate observes one whole group.
     pub partition_by: Vec<String>,
-    /// Optional within-group ordering. Applied to each group before its
-    /// predicate runs, so an order-sensitive `drop_group_when` (e.g. one
-    /// reading the first or last row) is deterministic.
-    #[serde(default)]
+    /// Optional within-group ordering: orders the rows of each group as
+    /// they are written. It does not change which groups are removed, since
+    /// each `drop_group_when` is evaluated over the group in arrival order
+    /// (#1264). Arrival order breaks ties. Each entry is a field name or a
+    /// full sort field; binding validates the list into placement-only
+    /// fields, refusing `null_order: drop`.
+    #[serde(
+        default,
+        deserialize_with = "crate::config::sort::deserialize_sort_field_list"
+    )]
     pub order_by: Vec<crate::config::SortField>,
     /// Declarative removal rules. A group is removed (routed to
     /// `removed_to`) when any rule's `drop_group_when` predicate holds.

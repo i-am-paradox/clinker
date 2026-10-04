@@ -198,6 +198,37 @@ permanent stability.
   [design rules](30_DESIGN_RULES.md#compiled-topology-is-authoritative).
 - **Verified:** 2026-07-29.
 
+### Ordering or grouping values
+
+- **Classification:** Preferred.
+- **Where:** `clinker_record::order`: `compare`, `encode` and the per-domain
+  `encode_*` functions, `ties`, `NumericTieClass` and `hash_tie_class`.
+- **Use:** Every comparison that sorts, groups, merges sorted runs or checks a
+  declared order goes through `clinker_record::order`: `compare` in memory,
+  `encode` for byte keys that are spilled or merged, and `ties` and
+  `hash_tie_class` for the order's tie and a hash that agrees with it. Group
+  keys carry their own `PartialEq`, `Hash` and `encode_tie_bytes` on
+  `GroupByKey`, which `group_key_equality_is_the_order_tie` in
+  `value_order_properties.rs` proves agree with `ties`. They define one total
+  order (numbers by exact value across integer, float and decimal; every NaN
+  one value above infinity; `-0.0` tied to `0.0`; a fixed rank across domains),
+  so an in-memory path and a spilled path cannot disagree. Nulls are placed by
+  the caller from the authored `null_order`, above the value order. A new
+  consumer adds its agreement property to
+  `crates/clinker-exec/tests/value_order_properties.rs`.
+- **Evidence:** `crates/clinker-record/src/order.rs` and
+  `crates/clinker-exec/tests/value_order_properties.rs`.
+- **Counterexamples / limits:** A local comparator, `Value::partial_cmp`, an
+  `f64` widening or a per-type byte encoding reintroduces the disagreement the
+  module removes. The Sort node's comparator and byte key
+  (`pipeline/sort_key.rs`) and group keys (`GroupByKey`, whose equality, hash
+  and `encode_tie_bytes` are the order's tie) are on it; the Cull and Reshape
+  group sorts call the Sort node's comparator over the plan node's
+  placement-only `order_by`, so they carry no rule of their own. The module
+  defines ordering, not predicates: a comparison
+  operator decides its own answer for a NaN or null operand.
+- **Verified:** 2026-10-04.
+
 ## Construction And Organization Patterns
 
 ### `SchemaBuilder` for incremental aligned construction

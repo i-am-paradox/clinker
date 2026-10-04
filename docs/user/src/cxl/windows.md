@@ -34,7 +34,7 @@ nodes:
 | Field | Description |
 |-------|-------------|
 | `group_by` | List of fields to partition the window by (the SQL `PARTITION BY` axis). |
-| `sort_by` | List of `{ field, order }` ordering specifications (`order` is `asc` or `desc`). |
+| `sort_by` | List of `{ field, order, null_order }` ordering specifications: `order` is `asc` (default) or `desc`, and `null_order` is `first` or `last` (default `last`), placing null keys before or after every value. Values compare by the rule every sort uses; see [How values are ordered](../nodes/sink.md#how-values-are-ordered). `null_order: drop` is rejected; see [Nulls in `sort_by`](#nulls-in-sort_by). |
 | `source` | Optional explicit source-name reference for cross-source windows. |
 | `on` | Optional cross-source partition-lookup field. |
 
@@ -45,6 +45,35 @@ There is no frame option. A window function reads one of three things:
 - **The whole partition.** `sum`, `avg`, `min`, `max`, `count`, `first_value`, `last_value`, `first()`, `last()`, `any`, `every`, `exists`, `not_exists`, `collect` and `distinct` read every row of the record's partition, whatever the record's position. Every record in a partition gets the same `$window.sum(amount)`.
 - **The partition up to the current record.** `cumulative_sum` is the running total, from the partition's first record (in `sort_by` order) through the current one.
 - **A position.** `row_number`, `rank` and `dense_rank` give the current record's place in `sort_by` order; `lag(n)` and `lead(n)` read the record `n` places before or after it.
+
+### Nulls in `sort_by`
+
+`sort_by` only orders the rows of a partition; every row of the partition is
+still seen by the window functions and written by the Transform. A row whose
+key is null is placed by `null_order`: before every value with `first`, after
+every value with `last`, in either direction.
+
+`null_order: drop` is rejected when the pipeline is planned:
+
+```text
+transform "running": `null_order: drop` is not allowed on `analytic_window.sort_by` for field "amount": `sort_by` only orders the rows of a window partition, placing nulls `first` or `last`, and cannot remove a row. To remove the rows whose "amount" is null, delete `null_order: drop` and add a Transform before this node with `config: { cxl: "filter not amount.is_null()" }`.
+```
+
+The one fix is the filter the error prints: delete `null_order: drop` and
+add a Transform before the windowed one whose whole `config` is the printed
+line. That leaves rows with a null key out of every partition, and also
+removes them from the windowed Transform's output:
+
+```yaml
+- type: transform
+  name: with_amount
+  input: orders
+  config: { cxl: "filter not amount.is_null()" }
+```
+
+For a field CXL cannot write as a bare name, the error prints a
+`source_name:` line instead; see
+[`source_name`](../nodes/source.md#source_name--read-a-differently-named-physical-column).
 
 ## Aggregate window functions
 
