@@ -42,9 +42,16 @@ fn source_completion_observes_worker_teardown_and_late_peak() {
             bytes,
         };
         let handle = ConsumerHandle::new();
-        let consumer = memory.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer = memory.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: "source".to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+            },
+        );
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let worker_memory = memory.clone();
         let worker = std::thread::spawn(move || {
@@ -52,7 +59,6 @@ fn source_completion_observes_worker_teardown_and_late_peak() {
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Work completed during join must contribute to the final peak.
             handle.set_bytes(512);
-            worker_memory.sample_peak_consumer_usage();
             drop(owned_spill);
             handle.set_bytes(0);
             worker_memory.unregister_consumer(consumer);

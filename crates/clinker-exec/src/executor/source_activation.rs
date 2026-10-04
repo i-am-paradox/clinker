@@ -14,6 +14,7 @@ use super::capabilities::{ActiveActivationGroup, AdmittedRunCapabilities, RunCap
 use super::context::SourceRuntimePolicy;
 use super::ingest::{IngestTaskOutcome, ingest_source_body};
 use super::source_stream::{SourceConsumer, SourceIngestChannel, SourceStreamEvent};
+use crate::pipeline::memory::ledger::Requester;
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator};
 use crate::telemetry::{
     MetricKey, SpanFact, SpanName, SpanStatus, TelemetryProducer, unix_nanos_now,
@@ -81,7 +82,7 @@ impl SourceActivationController {
         memory: &Arc<MemoryArbitrator>,
         shutdown: Option<crate::pipeline::shutdown::ShutdownToken>,
         telemetry: Option<&TelemetryProducer>,
-        allocation_resources: &clinker_record::owned_storage::AllocationResources,
+        allocation: &crate::executor::preparation::AllocationAttribution,
     ) -> Result<Option<ActivatedSourceGroup>, PipelineError> {
         let CompiledSourceScope::CompositionBody(scope) = instance.scope else {
             return Ok(None);
@@ -136,18 +137,24 @@ impl SourceActivationController {
                 format!("{logical_prefix}.{source_name}")
             };
             let handle = ConsumerHandle::new();
+            // Registered before its stream exists so every record the stream
+            // allocates is charged in this Source's name.
+            let consumer_id = memory.register_node_consumer(
+                Arc::new(SourceConsumer::new(Arc::clone(&handle))),
+                Arc::clone(&handle),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: source_name.clone(),
+                    surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+                },
+            );
             let (stream, receiver) = SourceIngestChannel::new(
                 SourceIngestChannel::DEFAULT_CAPACITY,
                 Arc::clone(&handle),
                 member.source_node,
-                allocation_resources.clone(),
+                allocation.attributed_allocation(Requester::for_consumer(consumer_id)),
             );
             #[cfg(test)]
-            stream.assert_allocation_domain(allocation_resources);
-            let consumer_id = memory.register_node_consumer(
-                &source_name,
-                Arc::new(SourceConsumer::new(Arc::clone(&handle))),
-            );
+            stream.assert_allocation_domain(&allocation.shared());
             activated.receivers.push((source_name.clone(), receiver));
             activated
                 .consumers

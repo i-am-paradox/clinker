@@ -47,16 +47,34 @@ their heap allocations. The handles expose neither a detachable box nor its
 lease. Tests observe the charge at allocator deallocation, including unwinding,
 rather than treating payload destruction or a final zero balance as proof.
 
-The executor admission ledger serializes reservations and limit changes. It
-subtracts sampled legacy consumer usage and outstanding writer grants before
-admitting another layout. Legacy samples remain estimates, not atomic grants.
-`writer_resource_usage()` derives current memory, peak memory, disk and
-descriptor usage from this ledger. `set_limit` refuses a limit below outstanding
-writer grants and leaves the previous limit unchanged; the disk setter likewise
+The executor admission ledger is the run's one charged total; it serializes
+reservations, consumer charges and limit changes. Governed allocations charge
+it through `MemoryArbitrator::reserve`, which checks and charges under the
+ledger's one lock and returns a `Grant` or a `Shortfall`. Registering a
+consumer (`register_consumer` for run-scoped state, `register_node_consumer`
+for a node's state, each with the consumer's `ConsumerHandle` and a label)
+binds the handle to the same ledger: from then until the consumer
+unregisters, every charge through the handle is a ledger charge under that
+lock, and unregistering releases what the handle still holds.
+`ConsumerHandle::try_grow` and `try_resize` check a growth against the limit
+with every other charge, so a handle growth and a governed allocation, or two
+of either, can never together pass the limit; the older `set_bytes` /
+`add_bytes` charges are applied unchecked. A `Shortfall` charges nothing and
+carries a snapshot taken under the same lock: the limit, the charged total, each labelled holder's
+current bytes under its node name and an author-vocabulary surface, and the
+bytes no labelled holder owns, so
+the holders and that remainder add up to the charged total. A reserve made for
+a consumer is attributed to it for the life of the grant, and the ledger keeps
+each consumer's high-water mark over its handle bytes plus its attributed
+bytes; attribution never changes what is admitted. Every release advances a
+release epoch. `writer_resource_usage()` derives current memory, peak memory,
+disk and descriptor usage from this ledger; its memory figures are what
+governed allocation grants hold, not the consumer handle charges beside them. `set_limit` refuses a limit below the
+charged total and leaves the previous limit unchanged; the disk setter likewise
 refuses a quota below the sum of outstanding writer disk and legacy spill bytes.
 
-The execution report samples the arbitrator's spill totals and peak consumer
-usage after dispatch has finished and every Source worker has joined. Ordered
+The execution report samples the arbitrator's spill totals and the ledger's
+charged peak after dispatch has finished and every Source worker has joined. Ordered
 Sources can still release staged spill charges while unwinding cancellation;
 sampling at dispatch close would report those already-released bytes as live.
 The total and per-stage spill fields include committed charges minus releases,
@@ -67,22 +85,32 @@ Two further report figures answer per-node questions those totals cannot.
 never lowered by a release, so a sort whose runs were merged and unlinked
 before the run ended still shows the bytes it wrote while its on-disk entry is
 back at zero. `per_node_peak_charged_bytes` gives, for each node whose state is
-registered under the node's name (`register_node_consumer`), the highest
-charge any one of its consumers reached. Every `ConsumerHandle` charge raises
-that consumer's mark, so the figure is exact per consumer rather than sampled,
-and another node's state never raises it. A node with several consumers
-reports the largest single consumer's mark. Run-scoped state that no node owns
-(writer output staging, the credential registry) registers through
-`register_consumer` and has no entry. The run-wide `peak_consumer_usage_bytes`
-remains a sum sampled at streaming charges.
+registered under the node's name (`register_node_consumer`, whose label names
+the node), the highest charge any one of its consumers reached. The ledger
+keeps each consumer's mark over its handle's bytes plus the governed
+allocations made in its name, and every charge to either raises it, so the
+figure is exact per consumer rather than sampled, and another node's state
+never raises it. A node with several consumers reports the largest single
+consumer's mark. Run-scoped state that no node owns (writer output staging,
+the credential registry, the document dead-letter state) registers through
+`register_consumer` and has no entry. The report's run-wide charged peak is
+the ledger's own: the most bytes charged at one instant, consumer handles and
+governed allocations together, raised by every charge rather than taken only
+when a streaming batch is charged.
 
-`WriterResourceConsumer` reports the ledger's exact live grant total through its
-`ConsumerHandle`. It is admission-managed and never backpressureable: parking
+`WriterResourceConsumer`'s `ConsumerHandle` charges nothing: its staging chunks
+are governed allocations the ledger already holds, so a handle charge would
+count every staged byte twice. It stays registered for its inventory row. It
+is never backpressureable: parking
 the synchronous writer would prevent its own release progress. Spill requests
 are consumed at chunk boundaries, and cancellation is checked before consulting
-pause state. Grants and cleanup debt keep the admission owner registered after
-the provider handle drops; the final owner unregisters it on success, error or
-cancellation while the run remains open. Closing the run closes admission and
+pause state. Grants and cleanup debt issued through the writer's own admission
+keep the admission owner registered after the provider handle drops; the final
+owner unregisters it on success, error or cancellation while the run remains
+open. A lease issued through a Source's attributed view is the exception: it
+releases through its reservation state and holds no release authority, so it
+does not keep the writer consumer registered. The accounting stays correct
+because that consumer's handle charges nothing. Closing the run closes admission and
 unregisters the consumer even if an allocation escapes the run. Such an
 allocation retains only the synchronized release state and a weak arbitrator
 reference, so its eventual drop still settles the ledger without retaining the
@@ -97,7 +125,11 @@ Named fixed startup allowances are the standalone Arc/mutex control block and
 the executor authority, admission, consumer and storage control blocks. The
 environment-derived current-directory lookup is a temporary startup allowance;
 retained authored paths, path-construction envelopes and descriptor inventories
-are admitted separately. CSV's raw parser buffers and the full intermediate
+are admitted separately. Each Source channel's slot array
+(`SourceIngestChannel::DEFAULT_CAPACITY` slots, allocated once when the channel
+is built) is a fixed allowance, constant in input size: a queued attempt's
+fixed shell lives in a slot, so only the heap the attempt holds outside the
+ledger is charged to its Source. CSV's raw parser buffers and the full intermediate
 JSON tree used for JSON-encoded cells remain explicit parser allowances.
 Unchanged readers and legacy operators retain their existing owners; a later
 deep copy or spill reload is a distinct allocation, not an extension of the
@@ -228,8 +260,10 @@ admission uses `unaccounted_heap_size` with the executing run's live allocation
 resources. It excludes a backing allocation only when its lease belongs to that
 same ledger, then classifies each child independently. A custom library source
 can supply governed storage from a different provider; that foreign allocation
-still contributes its physical estimate to this run. The comparison reuses the
-existing authority identity and never transfers or releases a grant.
+contributes its size to the Source's charge for as long as it is queued in the
+Source's channel, and the operator that keeps it downstream charges it under
+its own rule. The comparison reuses the existing authority identity and never
+transfers or releases a grant.
 
 The separate legacy-only traversal describes storage representation and does
 not establish which run owns a charge. Neither traversal subtracts a global
@@ -309,7 +343,7 @@ dataset boundary. Raw temporary bytes are internal storage, not a new dataset.
 
 ### Existing consumer attribution
 
-Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; that counter is the consumer handle's charge on the run's one ledger, and the arbitrator queries `current_usage()` per consumer at every policy poll to rank victims. A Source ingest channel's handle charges exactly the heap its queued attempts hold outside the run's ledger (foreign-provider or legacy storage, and a rejection's box): each attempt carries that charge from just before it is sent until the walk takes it off the channel, or until it is dropped unconsumed. Its records' admitted bytes are charged when they are allocated, in the Source's name, so no byte is counted twice. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
 
 Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry after its final planned reader. A consumer that collects a sequential scan into a resident vector carries an RAII materialization reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.
 
@@ -354,11 +388,15 @@ pause-only Source shape: it inserts a verification barrier around each physical
 file before the ingest channel releases that file downstream. The barrier reuses
 the Source consumer's live-byte counter. While a file is staged, that counter is
 the shared `SortBuffer`'s resident bytes plus one adjacent record retained for
-inversion detection, plus any verified records from the preceding file still
-queued downstream. During resident release, ownership moves from the sorter to
-an explicitly charged release total and then to the bounded-channel estimate;
-the transition subtracts a record only after the send succeeds, so the same row
-is neither omitted nor charged twice. Document punctuation does not grow with
+inversion detection, plus the charges of any verified records from the
+preceding file still queued downstream. During resident release, ownership
+moves from the sorter to an explicitly charged release total and then to the
+queued record's own charge, the same exact per-attempt charge an unordered
+Source's attempts carry. That last hand-off is one step on the counter, taken
+before the send, so the same row is neither omitted nor charged twice; a failed
+send drops the record together with its charge. The barrier moves the counter
+only by the change in its own figure, so it never overwrites the charges its
+queued records carry. Document punctuation does not grow with
 row count: admission allows only a flat file or one matching inner frame, so the
 barrier holds a statically bounded set of open/close events. Different physical
 files and different Sources never share a barrier or an authored-key comparison.

@@ -24,11 +24,12 @@ use crate::executor::dispatch::{
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{DlqEntry, DlqFailureStamp, parse_memory_limit, stage_metrics};
+use crate::executor::{DlqEntry, DlqFailureStamp, operator_memory_limit, stage_metrics};
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::types::AggregateStrategy;
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 
 /// Build the on-disk spill schema for an aggregate's group state: the
 /// group-by columns ++ `__acc_state` ++ `__meta_tracker`. Mirrors the
@@ -252,7 +253,7 @@ where
         // strict path below never reaches here, so the spill schema is built
         // only on this windowed branch — never built-then-dropped.
         let spill_schema = aggregate_spill_schema(compiled);
-        let mem_limit = parse_memory_limit(ctx.config);
+        let mem_limit = operator_memory_limit(&ctx.memory_budget);
         let win_ctx = WindowedAggContext {
             name,
             compiled,
@@ -301,7 +302,7 @@ where
             cxl::eval::DEFAULT_MAX_EXPANSION,
         );
         let spill_schema = aggregate_spill_schema(compiled);
-        let mem_limit = parse_memory_limit(ctx.config);
+        let mem_limit = operator_memory_limit(&ctx.memory_budget);
         // Resolve the spill compression mode against this aggregate's
         // output-schema width and the run's batch size, so spilled group
         // state matches what `--explain` projects for the operator: the
@@ -315,10 +316,14 @@ where
             .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         let agg_consumer_id = ctx.memory_budget.register_node_consumer(
-            name,
             Arc::new(crate::aggregation::AggregateConsumer::new(
                 agg_consumer_handle.clone(),
             )),
+            agg_consumer_handle.clone(),
+            ConsumerLabel {
+                node: name.to_string(),
+                surface: MemorySurface::GroupState,
+            },
         );
         let mut stream = crate::aggregation::AggregateStream::for_node(
             agg_strategy,
@@ -638,7 +643,7 @@ impl DocAggregatorFactory {
             max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
             output_schema: spec.output_schema.clone(),
             spill_schema,
-            mem_limit: parse_memory_limit(ctx.config),
+            mem_limit: operator_memory_limit(&ctx.memory_budget),
             spill_dir: ctx.spill_root_path.to_path_buf(),
             spill_compress,
             transform_name: spec.name.to_string(),
@@ -694,8 +699,14 @@ impl DocAggregatorFactory {
             },
         )?;
         let consumer_id = self.arbitrator.register_node_consumer(
-            &self.transform_name,
-            Arc::new(crate::aggregation::AggregateConsumer::new(handle)),
+            Arc::new(crate::aggregation::AggregateConsumer::new(Arc::clone(
+                &handle,
+            ))),
+            handle,
+            ConsumerLabel {
+                node: self.transform_name.clone(),
+                surface: MemorySurface::GroupState,
+            },
         );
         Ok((stream, consumer_id))
     }
@@ -1215,7 +1226,7 @@ fn run_streaming_aggregate_ingest(
     // change. The scoped thread's per-record `sub_bytes` discharge below
     // nets the producer's per-batch charge to zero.
     let (rx, charge_handle, charge_consumer_id) =
-        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name);
+        ctx.install_streaming_ingest_channel(producer_idx, &upstream_name, name);
 
     // Copy the stable-context reference out of `ctx` *before* the scope so
     // the scoped thread borrows `&'a StableEvalContext` directly (shared,
@@ -1519,10 +1530,14 @@ impl WindowedAggContext<'_> {
         );
         let agg_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
         let agg_consumer_id = ctx.memory_budget.register_node_consumer(
-            self.name,
             Arc::new(crate::aggregation::AggregateConsumer::new(
                 agg_consumer_handle.clone(),
             )),
+            agg_consumer_handle.clone(),
+            ConsumerLabel {
+                node: self.name.to_string(),
+                surface: MemorySurface::GroupState,
+            },
         );
         // Resolve the spill compression mode against this aggregate's
         // output-schema width and the run's batch size, matching the

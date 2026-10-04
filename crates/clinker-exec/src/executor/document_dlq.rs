@@ -82,6 +82,7 @@ use clinker_core_types::dlq::DlqErrorCategory;
 use clinker_plan::config::{CompressMode, SinkConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::PlanNodeId;
+use clinker_plan::runtime_error::{ConsumerLabel, MemorySurface};
 use roaring::RoaringTreemap;
 
 /// Identity of one document the policy operates on: its source file (the
@@ -465,10 +466,17 @@ impl DocumentDlqState {
     ) -> Self {
         let handle = ConsumerHandle::new();
         let log = ExtentLog::new(held.spill_root, held.compress, Arc::clone(&handle));
-        let consumer_id = arbitrator.register_consumer(Arc::new(DocumentDlqConsumer::new(
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(DocumentDlqConsumer::new(
+                Arc::clone(&handle),
+                log.resident_gauge(),
+            )),
             Arc::clone(&handle),
-            log.resident_gauge(),
-        )));
+            ConsumerLabel {
+                node: "dead letters".to_string(),
+                surface: MemorySurface::HeldFailingRows,
+            },
+        );
         Self {
             doc_sources,
             failed: HashMap::new(),
@@ -577,7 +585,6 @@ impl DocumentDlqState {
         if failed.emitted.unsettled >= SETTLE_EVERY_ADMISSIONS {
             settle_ledger(&self.handle, &mut failed.emitted);
         }
-        self.arbitrator.sample_peak_consumer_usage();
         Ok(true)
     }
 
@@ -587,7 +594,6 @@ impl DocumentDlqState {
         if let Some(failed) = self.failed.get_mut(key) {
             settle_ledger(&self.handle, &mut failed.emitted);
         }
-        self.arbitrator.sample_peak_consumer_usage();
     }
 
     /// Settle every ledger that took admissions since its last settle. A
@@ -599,7 +605,6 @@ impl DocumentDlqState {
                 settle_ledger(&self.handle, &mut failed.emitted);
             }
         }
-        self.arbitrator.sample_peak_consumer_usage();
     }
 
     /// The failed documents whose held rows no rejection has taken, in key
@@ -695,7 +700,6 @@ impl DocumentDlqState {
             self.handle.bytes() >= self.held.resident_bytes() + self.held.index_bytes(),
             "the state's charge covers its held rows"
         );
-        self.arbitrator.sample_peak_consumer_usage();
         self.appends += 1;
         Ok(())
     }
@@ -1404,10 +1408,14 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         buckets.entry(Arc::clone(key)).or_insert_with(|| {
             let handle = crate::pipeline::memory::ConsumerHandle::new();
             let consumer_id = arbitrator.register_node_consumer(
-                output_name,
                 Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                     handle.clone(),
                 )),
+                handle.clone(),
+                ConsumerLabel {
+                    node: output_name.to_string(),
+                    surface: MemorySurface::HeldFailingRows,
+                },
             );
             DocBucket {
                 buffer: NodeBuffer::Memory(Vec::new()),
@@ -1439,7 +1447,6 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 .buffer
                 .unaccounted_memory_bytes(&self.allocation_resources),
         );
-        self.arbitrator.sample_peak_consumer_usage();
         if self.arbitrator.should_spill() {
             spill_bucket_in_place(
                 bucket,
@@ -2128,6 +2135,26 @@ fn replay_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_label(node: &str) -> clinker_plan::runtime_error::ConsumerLabel {
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: node.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::HeldFailingRows,
+        }
+    }
+
+    /// A registered consumer whose only purpose is to own a `ConsumerId` a
+    /// victim-selection snapshot can name.
+    fn register_fresh(arbitrator: &MemoryArbitrator) -> ConsumerId {
+        let handle = ConsumerHandle::new();
+        arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle,
+            test_label("out"),
+        )
+    }
     use clinker_record::owned_storage::SharedStorage;
     use clinker_record::{
         DocumentContext, DocumentId, EnvelopeRecord, FieldMetadata, Schema, SchemaBuilder, Value,
@@ -2211,9 +2238,13 @@ mod tests {
         );
 
         let handle = ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut buffer = NodeBuffer::Memory(Vec::new());
         buffer.push(trigger_record, trigger_row);
         buffer.push(collateral_record, collateral_row);
@@ -2624,9 +2655,7 @@ mod tests {
         let node_handle = ConsumerHandle::new();
         node_handle.set_bytes(16);
         let node_consumer = crate::executor::node_buffer::NodeBufferConsumer::new(node_handle);
-        let node_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
-        ));
+        let node_id = register_fresh(&arbitrator);
         let (state, _key) = ledger_state(&arbitrator);
         state.handle.set_bytes(1 << 20);
         let ledger_consumer =
@@ -2669,9 +2698,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -2753,9 +2786,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -2801,9 +2838,13 @@ mod tests {
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-        ));
+        let consumer_id = arbitrator.register_consumer(
+            Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                handle.clone(),
+            )),
+            handle.clone(),
+            test_label("out"),
+        );
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
             consumer_id,
@@ -3099,12 +3140,8 @@ mod tests {
         let ledger_handle = ConsumerHandle::new();
         ledger_handle.set_bytes(1 << 20);
         let ledger_only = DocumentDlqConsumer::new(ledger_handle, Arc::new(AtomicU64::new(0)));
-        let node_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
-        ));
-        let ledger_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(ConsumerHandle::new()),
-        ));
+        let node_id = register_fresh(&arbitrator);
+        let ledger_id = register_fresh(&arbitrator);
         let snapshot: [(ConsumerId, &dyn MemoryConsumer); 3] = [
             (ledger_id, &ledger_only),
             (node_id, &node_consumer),
@@ -3388,7 +3425,11 @@ mod tests {
         );
 
         assert_eq!(state.held.resident_bytes(), 0, "nothing is left to flush");
-        arbitrator.set_limit(1).expect("limit");
+        // The tightest limit the ledger will take is what it already holds
+        // charged, so the next admission's growth is what overruns it.
+        arbitrator
+            .set_limit(arbitrator.charged_bytes())
+            .expect("limit");
         match state.admit_emitted(key, row(1, 99), node) {
             Err(PipelineError::MemoryBudgetExceeded { node, detail, .. }) => {
                 assert_eq!(node, "route_x");

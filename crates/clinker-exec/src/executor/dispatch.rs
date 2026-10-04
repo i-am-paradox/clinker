@@ -826,7 +826,15 @@ pub(crate) fn consume_source_event(
         crate::executor::source_stream::SourceStreamEvent::Punctuation(punctuation) => {
             Ok(ConsumedSourceEvent::Punctuation(punctuation))
         }
-        crate::executor::source_stream::SourceStreamEvent::Attempt { event, population } => {
+        crate::executor::source_stream::SourceStreamEvent::Attempt {
+            event,
+            population,
+            queued,
+        } => {
+            // The attempt has left the Source's channel: its queue charge
+            // ends here, before the record goes downstream, and whatever
+            // keeps the record charges it under its own rule.
+            drop(queued);
             let source_row = event.source_row();
             if let Some(population) = population {
                 if source_row.source() != population.source {
@@ -1491,6 +1499,9 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) writer_resources: clinker_format::preparation::WriterResources,
     /// Allocation admission borrows the run weakly, independently of writer staging.
     pub(crate) allocation_resources: clinker_record::owned_storage::AllocationResources,
+    /// Builds the allocation view each activated body Source reads through,
+    /// charged in that Source's name.
+    pub(crate) allocation_attribution: crate::executor::preparation::AllocationAttribution,
     // Borrowed plan-time state.
     pub(crate) config: &'a PipelineConfig,
     /// Bound composition bodies the dispatcher re-enters at runtime. The
@@ -1555,7 +1566,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// current DAG scope. Built once in one edge pass, then consulted in O(1)
     /// at publication so wide multi-port fan-out does not rescan the graph per
     /// port. Body scopes replace it alongside the mutable slot ledger.
-    pub(crate) planned_node_buffer_readers: HashMap<NodeBufferKey, usize>,
+    pub(crate) planned_node_buffer_readers: PlannedNodeBufferReaders,
     /// Per-slot consumer registration for window-runtime arenas.
     /// `finalize_node_rooted_windows` registers an `ArenaConsumer` with
     /// the pipeline-scoped arbitrator after each arena builds and stores
@@ -2279,11 +2290,12 @@ impl<'a> ExecutorContext<'a> {
     /// `add_bytes` the producer charges on flush is netted to zero by the
     /// consumer's per-record `sub_bytes` discharge. The charge consumer is
     /// registered under `producer_name`, the name the producer's streaming
-    /// spill is recorded under.
+    /// spill is recorded under, as the rows buffered for `reader_name`.
     pub(crate) fn install_streaming_ingest_channel(
         &mut self,
         producer_idx: NodeIndex,
         producer_name: &str,
+        reader_name: &str,
     ) -> (
         crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
         Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -2293,10 +2305,17 @@ impl<'a> ExecutorContext<'a> {
             crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
         let charge_consumer_id = self.memory_budget.register_node_consumer(
-            producer_name,
             Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                 charge_handle.clone(),
             )),
+            charge_handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: producer_name.to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                    from: producer_name.to_string(),
+                    to: reader_name.to_string(),
+                },
+            },
         );
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
@@ -2398,15 +2417,16 @@ impl<'a> ExecutorContext<'a> {
     }
 
     /// Release the arbitrator registration for `source_name`'s ingest
-    /// channel once its receiver has disconnected. The producer mirrors
-    /// `queue depth × per-record bytes` into the shared handle on every
-    /// push and never zeroes it, so without this release the last push's
-    /// estimate stays summed into `sum_consumer_usage` for the rest of the
-    /// run — memory that has already moved downstream keeps influencing
-    /// spill victim selection and abort checks. Call only after `recv`
-    /// reports disconnect: the producer has dropped its sender by then, so
-    /// zeroing cannot race a concurrent `set_bytes`. The `remove` makes the
-    /// release single-shot; a repeat call for the same source is a no-op.
+    /// channel once its receiver has disconnected. Every queued attempt
+    /// released its own charge when it left the channel, but an ordered
+    /// Source's barrier never zeroes the figure it last charged to the shared
+    /// handle, so without this release that figure stays in the run's
+    /// charged total — memory that has already moved downstream keeps
+    /// influencing spill victim selection and abort checks. Call only after
+    /// `recv` reports disconnect: the producer has dropped its sender by
+    /// then, so zeroing cannot race a concurrent charge. The `remove` makes
+    /// the release single-shot; a repeat call for the same source is a
+    /// no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
         if let Some((id, handle)) = self.source_consumers.remove(source_name) {
             // Resume before unregister: a prior arbitration round may have
@@ -3189,6 +3209,14 @@ impl NodeBufferAdmission {
     fn release_prior(&mut self) {
         drop(self.prior.take());
     }
+    /// Charge `bytes` to `handle`, the slot that now owns these rows, taking
+    /// them over from the prior owner in one step when there is one.
+    fn charge_to(&mut self, handle: &crate::pipeline::memory::ConsumerHandle, bytes: u64) {
+        match self.prior.take() {
+            Some(prior) => prior.hand_over(handle, bytes),
+            None => handle.add_bytes(bytes),
+        }
+    }
 }
 
 pub(crate) fn admit_node_buffer_with_prior_owner(
@@ -3331,6 +3359,57 @@ pub(crate) fn admit_node_buffer_transferred(
     }
 }
 
+/// The planned readers of every producer-owned materialized slot in one DAG
+/// scope, and the name of every node in it, built once per scope.
+#[derive(Default)]
+pub(crate) struct PlannedNodeBufferReaders {
+    /// One entry per reading edge, so the length is the slot's reader count.
+    readers: HashMap<NodeBufferKey, Vec<Box<str>>>,
+    node_names: HashMap<NodeIndex, Box<str>>,
+}
+
+impl PlannedNodeBufferReaders {
+    fn count(&self, key: &NodeBufferKey) -> usize {
+        self.readers.get(key).map_or(0, Vec::len)
+    }
+
+    /// The label a slot's charge is reported under: the rows `producer`
+    /// buffered for the nodes that read the slot. A successor-local slot is
+    /// read by the node it is keyed on; a slot with no planned reader (a
+    /// composition body's terminal output) is read by the composition.
+    pub(crate) fn slot_label(
+        &self,
+        producer: &str,
+        key: &NodeBufferKey,
+        composition_call_sites: &[String],
+    ) -> clinker_plan::runtime_error::ConsumerLabel {
+        let mut readers: Vec<&str> = Vec::new();
+        for name in self.readers.get(key).into_iter().flatten() {
+            if !readers.contains(&&**name) {
+                readers.push(name);
+            }
+        }
+        let to = if !readers.is_empty() {
+            readers.join(", ")
+        } else if let Some(keyed) = self.node_names.get(&key.node)
+            && &**keyed != producer
+        {
+            keyed.to_string()
+        } else if let Some(call_site) = composition_call_sites.last() {
+            call_site.clone()
+        } else {
+            producer.to_string()
+        };
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: producer.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                from: producer.to_string(),
+                to,
+            },
+        }
+    }
+}
+
 /// Build the exact structural reader cardinality for every producer-owned
 /// materialized slot in one O(V + E) pass per DAG scope.
 ///
@@ -3340,11 +3419,14 @@ pub(crate) fn admit_node_buffer_transferred(
 /// multi-input predecessor-slot readers contribute here.
 pub(crate) fn planned_materialized_reader_counts(
     current_dag: &ExecutionPlanDag,
-) -> HashMap<NodeBufferKey, usize> {
+) -> PlannedNodeBufferReaders {
     use petgraph::visit::EdgeRef;
 
-    let mut counts = HashMap::new();
+    let mut planned = PlannedNodeBufferReaders::default();
     for producer in current_dag.graph.node_indices() {
+        planned
+            .node_names
+            .insert(producer, Box::from(current_dag.graph[producer].name()));
         let producer_preforks = matches!(
             current_dag.graph[producer],
             PlanNode::Route { .. } | PlanNode::Cull { .. }
@@ -3363,10 +3445,14 @@ pub(crate) fn planned_materialized_reader_counts(
                 continue;
             }
             let key = NodeBufferKey::with_port(producer, edge.weight().producer_port.as_deref());
-            *counts.entry(key).or_insert(0) += 1;
+            planned
+                .readers
+                .entry(key)
+                .or_default()
+                .push(Box::from(current_dag.graph[target].name()));
         }
     }
-    counts
+    planned
 }
 
 /// Read the precomputed publication cardinality in O(1), while failing loudly
@@ -3383,11 +3469,7 @@ fn planned_materialized_reader_count(
             detail: format!("node-buffer slot {key:?} does not belong to the current DAG scope"),
         });
     }
-    Ok(ctx
-        .planned_node_buffer_readers
-        .get(key)
-        .copied()
-        .unwrap_or(0))
+    Ok(ctx.planned_node_buffer_readers.count(key))
 }
 
 fn admit_node_buffer_inner(
@@ -3450,30 +3532,30 @@ fn admit_node_buffer_inner(
         if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
             ctx.memory_budget.unregister_consumer(prev_id);
         }
+        // Registered empty: the slot's bytes are charged below, taken over
+        // from the rows' prior owner in one step when they have one.
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        handle.set_bytes(bytes);
-        let consumer_id = ctx.memory_budget.register_node_consumer(
+        let label = ctx.planned_node_buffer_readers.slot_label(
             node_name,
+            &slot_key,
+            &ctx.composition_call_sites,
+        );
+        let consumer_id = ctx.memory_budget.register_node_consumer(
             Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                 handle.clone(),
             )),
+            handle.clone(),
+            label,
         );
+        owned.charge_to(&handle, bytes);
         (consumer_id, handle)
     };
     ctx.node_buffer_consumer_ids
         .insert(slot_key, (consumer_id, handle.clone()));
-    // Establish the NodeBuffer owner first, then release only the prior
-    // producer portion before any local pressure or peak sample. These are
-    // legacy observations, not an atomic whole-engine ledger transfer.
+    // Establish the NodeBuffer owner first, then release any prior producer
+    // portion still held before any local pressure poll.
     owned.release_prior();
     let NodeBufferAdmission { rows, puncts, .. } = owned;
-    // Raise the run's high-water mark now that this slot's charge has
-    // joined the registry. Sampling at admission (not only on streaming
-    // batch charges) makes `peak_consumer_usage_bytes` a faithful peak
-    // over every coexisting `node_buffers` slot — which is the quantity
-    // dispatch order moves: finishing a chain's blocking consumer before
-    // charging the next chain's source keeps fewer slots live at once.
-    ctx.memory_budget.sample_peak_consumer_usage();
     debug_assert!(
         spill_allowed,
         "every published materialized node-buffer slot must be spill-eligible"
@@ -3822,10 +3904,14 @@ pub(crate) fn finalize_node_rooted_windows(
         let arena_handle = crate::pipeline::memory::ConsumerHandle::new();
         arena_handle.set_bytes(arena.estimated_bytes() as u64);
         let arena_consumer_id = ctx.memory_budget.register_node_consumer(
-            current_dag.graph[upstream_idx].name(),
             Arc::new(crate::pipeline::arena::ArenaConsumer::new(
                 arena_handle.clone(),
             )),
+            arena_handle.clone(),
+            clinker_plan::runtime_error::ConsumerLabel {
+                node: current_dag.graph[upstream_idx].name().to_string(),
+                surface: clinker_plan::runtime_error::MemorySurface::WindowIndex,
+            },
         );
         ctx.window_arena_consumer_ids
             .insert(idx, (arena_consumer_id, arena_handle));
@@ -4259,8 +4345,9 @@ pub(crate) fn merge_fused_interleave(
                 // Source closed. Stamp finalized per-source count, drop
                 // the receiver slot so subsequent iterations skip it, and
                 // release the source's arbitrator registration — its
-                // channel is drained, so its queue estimate must leave
-                // `sum_consumer_usage`.
+                // channel is drained, so the Source's per-attempt queued
+                // charge must leave the ledger total `sum_consumer_usage`
+                // reads.
                 let count = per_source_counts[i];
                 let name_arc = Arc::clone(&states[i].source_name_arc);
                 receivers[i] = None;
@@ -5380,6 +5467,13 @@ mod output_admission_ownership_tests {
     use crate::executor::batch_handoff::StreamingReservation;
     use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator, NoOpPolicy};
 
+    fn test_label(node: &str) -> clinker_plan::runtime_error::ConsumerLabel {
+        clinker_plan::runtime_error::ConsumerLabel {
+            node: node.to_string(),
+            surface: clinker_plan::runtime_error::MemorySurface::SortBuffer,
+        }
+    }
+
     #[test]
     fn output_admission_prior_owner_survives_rejection_and_spill_failure() {
         for mode in ["unused", "adopt", "spill-failure"] {
@@ -5390,9 +5484,13 @@ mod output_admission_ownership_tests {
                 Box::new(NoOpPolicy),
             ));
             let prior_handle = ConsumerHandle::new();
-            let prior_id = budget.register_consumer(Arc::new(
-                crate::pipeline::sort_buffer::SortConsumer::new(prior_handle.clone()),
-            ));
+            let prior_id = budget.register_consumer(
+                Arc::new(crate::pipeline::sort_buffer::SortConsumer::new(
+                    prior_handle.clone(),
+                )),
+                prior_handle.clone(),
+                test_label("sorted"),
+            );
             // This unrelated portion must survive release of the output token.
             prior_handle.add_bytes(7);
             let schema = SharedStorage::from_arc(Arc::new(clinker_record::Schema::new(vec![
@@ -5403,7 +5501,7 @@ mod output_admission_ownership_tests {
                 0u64.into(),
             )];
             let bytes = estimate_node_buffer_bytes(&rows);
-            let owner = StreamingReservation::retain(prior_handle.clone(), budget.clone(), bytes);
+            let owner = StreamingReservation::retain(prior_handle.clone(), bytes);
             let mut owned = NodeBufferAdmission::with_prior_owner(rows, Vec::new(), Some(owner));
             assert_eq!(prior_handle.bytes(), bytes + 7);
             if mode == "unused" {
@@ -5412,12 +5510,17 @@ mod output_admission_ownership_tests {
                 drop(owned);
             } else {
                 let next = ConsumerHandle::new();
-                next.set_bytes(bytes);
-                let next_id = budget.register_consumer(Arc::new(
-                    crate::executor::node_buffer::NodeBufferConsumer::new(next.clone()),
-                ));
+                let next_id = budget.register_consumer(
+                    Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+                        next.clone(),
+                    )),
+                    next.clone(),
+                    test_label("output"),
+                );
+                owned.charge_to(&next, bytes);
                 owned.release_prior();
-                budget.sample_peak_consumer_usage();
+                assert_eq!(next.bytes(), bytes);
+                assert_eq!(prior_handle.bytes(), 7);
                 assert_eq!(budget.sum_consumer_usage(), bytes + 7);
                 assert_eq!(
                     budget.peak_consumer_usage(),

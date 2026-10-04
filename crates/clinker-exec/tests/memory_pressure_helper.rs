@@ -5,11 +5,11 @@
 //! prove it has teeth: a node with no charged state, a pair whose state fits
 //! under the low limit, an ample run that spilled, a low run that did not
 //! spill the node or held the whole state, differing outputs, and a limit
-//! that differs from the plan's are each refused. The tests that read real
-//! runs check the helper's field mapping against the executor rather than
-//! restating it: the node's own charged peak, never the run-wide sum, and the
-//! bytes a stage wrote to spill files, even when it deleted them before the
-//! run ended.
+//! that differs from the one the run enforced are each refused. The tests
+//! that read real runs check the helper's field mapping against the executor
+//! rather than restating it: the node's own charged peak, never the run-wide
+//! sum, and the bytes a stage wrote to spill files, even when it deleted them
+//! before the run ended.
 
 #[path = "common/memory_pressure.rs"]
 mod memory_pressure;
@@ -19,12 +19,13 @@ mod resource_fixtures;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{
-    ExecutionReport, PipelineExecutor, PipelineRunParams, single_file_reader,
-};
-use clinker_plan::config::{CompileContext, PipelineConfig, parse_config};
-use clinker_plan::plan::CompiledPlan;
-use memory_pressure::{PressureRun, assert_arbitrated, effective_limit_bytes};
+use clinker_exec::executor::{ExecutionReport, PipelineExecutor, PipelineRunParams};
+#[cfg(feature = "test-utils")]
+use clinker_exec::executor::{MemoryTestOverrides, single_file_reader};
+#[cfg(feature = "test-utils")]
+use clinker_plan::config::PipelineConfig;
+use clinker_plan::config::{CompileContext, parse_config};
+use memory_pressure::{PressureRun, assert_arbitrated};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -136,7 +137,7 @@ nodes:
 "#;
 
 /// Run the passthrough pipeline over two rows.
-fn run_passthrough() -> (CompiledPlan, ExecutionReport, Vec<u8>) {
+fn run_passthrough() -> (ExecutionReport, Vec<u8>) {
     let config = parse_config(PASSTHROUGH_YAML).expect("parse passthrough pipeline");
     let plan = config
         .compile(&CompileContext::default())
@@ -164,23 +165,23 @@ fn run_passthrough() -> (CompiledPlan, ExecutionReport, Vec<u8>) {
         .expect("the two-row passthrough completes");
     let output = buf.contents();
     assert!(!output.is_empty(), "the sink wrote the two rows");
-    (plan, report, output)
+    (report, output)
 }
 
 #[test]
-#[should_panic(expected = "disagrees with the plan's effective limit")]
-fn a_limit_that_disagrees_with_the_plan_is_refused() {
-    let (plan, report, output) = run_passthrough();
+#[should_panic(expected = "is not the limit the run enforced (536870912 bytes)")]
+fn a_limit_the_run_did_not_enforce_is_refused() {
+    let (report, output) = run_passthrough();
     // The pipeline runs under 512M; a test that claims 2 MiB would compare
     // the node's state against a limit the run never had.
-    let _ = PressureRun::from_report(&report, &plan, "events", 2 * MIB, output);
+    let _ = PressureRun::from_report(&report, "events", 2 * MIB, output);
 }
 
 #[test]
 fn from_report_reads_the_nodes_own_charged_peak() {
-    let (plan, mut report, output) = run_passthrough();
+    let (mut report, output) = run_passthrough();
 
-    let run = PressureRun::from_report(&report, &plan, "events", 512 * MIB, output.clone());
+    let run = PressureRun::from_report(&report, "events", 512 * MIB, output.clone());
     assert_eq!(run.limit_bytes, 512 * MIB);
     assert_eq!(run.output, output);
     let events_peak = report
@@ -193,7 +194,7 @@ fn from_report_reads_the_nodes_own_charged_peak() {
 
     // The Sink registers no state of its own, so it has no peak, even though
     // the run as a whole charged bytes.
-    let sink = PressureRun::from_report(&report, &plan, "out", 512 * MIB, output.clone());
+    let sink = PressureRun::from_report(&report, "out", 512 * MIB, output.clone());
     assert_eq!(sink.peak_charged_bytes, None);
 
     // Other nodes' charges and the run-wide sampled sum never reach the
@@ -202,7 +203,7 @@ fn from_report_reads_the_nodes_own_charged_peak() {
         .per_node_peak_charged_bytes
         .insert("other_node".to_string(), 64 * MIB);
     report.peak_consumer_usage_bytes = 128 * MIB;
-    let again = PressureRun::from_report(&report, &plan, "events", 512 * MIB, output);
+    let again = PressureRun::from_report(&report, "events", 512 * MIB, output);
     assert_eq!(again.peak_charged_bytes, Some(events_peak));
 
     // Ample memory: nothing reached disk, so the node reads as unspilled.
@@ -213,7 +214,7 @@ fn from_report_reads_the_nodes_own_charged_peak() {
 
 #[test]
 fn from_report_reads_spill_bytes_written_not_bytes_left_on_disk() {
-    let (plan, mut report, output) = run_passthrough();
+    let (mut report, output) = run_passthrough();
     // Every run the node wrote was deleted before the report: nothing is
     // left on disk, but the node did spill.
     report.per_stage_spill_bytes.insert("out".to_string(), 0);
@@ -224,7 +225,7 @@ fn from_report_reads_spill_bytes_written_not_bytes_left_on_disk() {
     report
         .per_stage_spill_bytes_written
         .insert("out".to_string(), 11);
-    let run = PressureRun::from_report(&report, &plan, "out", 512 * MIB, output);
+    let run = PressureRun::from_report(&report, "out", 512 * MIB, output);
     assert_eq!(run.node_spill_bytes, 11, "the node's own written bytes");
     assert_eq!(run.total_spill_bytes, 18, "every stage's written bytes");
 }
@@ -232,6 +233,7 @@ fn from_report_reads_spill_bytes_written_not_bytes_left_on_disk() {
 /// A Source that declares `sort_order: [key]` and repairs unsorted input.
 /// Its order barrier sorts the rows through spilled runs under a small
 /// limit, merges them, and deletes every run before the report is taken.
+#[cfg(feature = "test-utils")]
 fn order_repair_yaml(limit: &str) -> String {
     format!(
         r#"
@@ -261,10 +263,18 @@ nodes:
     )
 }
 
-fn run_order_repair(limit: &str) -> (CompiledPlan, ExecutionReport, Vec<u8>) {
+/// The order-repair config at `limit`, with the CSV workspace added.
+#[cfg(feature = "test-utils")]
+fn order_repair_config(limit: &str) -> PipelineConfig {
     let mut config: PipelineConfig =
         clinker_plan::yaml::from_str(&order_repair_yaml(limit)).expect("parse order repair");
     resource_fixtures::add_csv_workspace(&mut config, &CompileContext::default());
+    config
+}
+
+#[cfg(feature = "test-utils")]
+fn run_order_repair(limit: &str, memory_test: MemoryTestOverrides) -> (ExecutionReport, Vec<u8>) {
+    let config = order_repair_config(limit);
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile order repair");
@@ -285,18 +295,40 @@ fn run_order_repair(limit: &str) -> (CompiledPlan, ExecutionReport, Vec<u8>) {
         &plan,
         readers,
         writers,
-        &PipelineRunParams::default(),
+        &PipelineRunParams {
+            memory_test,
+            ..Default::default()
+        },
     )
     .expect("the order repair completes");
-    (plan, report, buf.contents())
+    (report, buf.contents())
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_sort_that_deleted_its_runs_still_reads_as_spilled() {
+    use memory_pressure::{assert_capacity_below_ample_peak, assert_spill_engaged};
+
     // The order barrier records its repair runs under this stage key.
     const REPAIR: &str = "source-order:rows:records";
 
-    let (plan, report, low_output) = run_order_repair("40K");
+    // The low run is held to 88 KiB of ledger. It completes at 80,000 bytes
+    // (at 76,000 the CSV reader's 16 KiB admission falls short), and the same
+    // input with ample memory charges 99,568 bytes at its peak. The limit it
+    // had before capacity existed, the authored 40K plus the CSV workspace the
+    // fixture adds (106,496 bytes), lies above that peak, so the capacity is
+    // taken inside the window, and never above that old limit.
+    const CAPACITY: u64 = 88 * 1024;
+    let old_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
+        order_repair_config("40K").pipeline.memory.limit.as_deref(),
+    )
+    .expect("parse the old limit");
+    assert!(CAPACITY <= old_limit);
+    let capacity = CAPACITY;
+    let (report, low_output) = run_order_repair(
+        "64M",
+        MemoryTestOverrides::default().with_ledger_capacity(capacity),
+    );
     assert_eq!(
         report
             .per_stage_spill_bytes
@@ -313,21 +345,28 @@ fn a_sort_that_deleted_its_runs_still_reads_as_spilled() {
         .unwrap_or(0);
     assert!(
         written > 0,
-        "the repair spilled under 40K: {:?}",
+        "the repair spilled under its ledger capacity: {:?}",
         report.per_stage_spill_bytes_written
     );
-    // The CSV workspace fixture adds its own reservation to `memory.limit`,
-    // so the plan runs above the authored 40K; the helper would refuse
-    // 40 * 1024 here, so the test states the plan's effective limit.
-    let low_limit = effective_limit_bytes(&plan);
+    // The run enforces its ledger capacity, more than the authored 40K; the
+    // helper would refuse 40 * 1024 here, so the test states the limit the
+    // run's report says it enforced.
+    assert_eq!(
+        report.memory_limit_bytes, CAPACITY,
+        "the low run enforces the ledger capacity it was held to"
+    );
+    let low_limit = report.memory_limit_bytes;
     assert!(low_limit > 40 * 1024);
-    let low = PressureRun::from_report(&report, &plan, REPAIR, low_limit, low_output.clone());
+    let low = PressureRun::from_report(&report, REPAIR, low_limit, low_output.clone());
     assert_eq!(low.node_spill_bytes, written);
     assert!(low.total_spill_bytes >= written);
+    let low_report = report;
 
-    let (plan, report, ample_output) = run_order_repair("64M");
-    let ample_limit = effective_limit_bytes(&plan);
-    let ample = PressureRun::from_report(&report, &plan, REPAIR, ample_limit, ample_output);
+    assert_spill_engaged(&low_report);
+    let (report, ample_output) = run_order_repair("64M", MemoryTestOverrides::default());
+    assert_capacity_below_ample_peak(capacity, &report);
+    let ample_limit = report.memory_limit_bytes;
+    let ample = PressureRun::from_report(&report, REPAIR, ample_limit, ample_output);
     assert_eq!(ample.node_spill_bytes, 0);
     assert_eq!(ample.total_spill_bytes, 0);
     assert_eq!(low.output, ample.output, "spilling changes no output byte");

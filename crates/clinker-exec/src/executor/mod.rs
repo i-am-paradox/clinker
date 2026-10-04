@@ -65,7 +65,11 @@ pub use document_dlq::{DocumentDlqTeardown, take_document_dlq_teardown_for_testi
 pub use ingest::build_source_format_reader;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
-pub use params::{ExecutionReport, PipelineRunParams, PreviewPolicy, RunPolicy};
+pub use params::{
+    ExecutionReport, MemoryTestOverrides, PipelineRunParams, PreviewPolicy, RunPolicy,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use params::{ForcedShortfall, IN_PROCESS_BASELINE_BYTES};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
 pub(crate) use route::CompiledRoute;
@@ -82,7 +86,7 @@ pub(crate) use transform::{
 use util::scheduled_pass_order;
 pub(crate) use util::{
     GroupedNodeKind, build_arbitrator_from_config, copy_build_ck_columns, format_group_key,
-    giant_group_error, parse_memory_limit, record_with_emitted_fields, widen_record_to_schema,
+    giant_group_error, operator_memory_limit, record_with_emitted_fields, widen_record_to_schema,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -207,6 +211,7 @@ struct SourceCompletion {
     per_stage_spill_bytes_written: BTreeMap<String, u64>,
     peak_consumer_usage_bytes: u64,
     per_node_peak_charged_bytes: BTreeMap<String, u64>,
+    memory_limit_bytes: u64,
 }
 
 impl SourceCompletion {
@@ -222,6 +227,7 @@ impl SourceCompletion {
             per_stage_spill_bytes_written: memory.per_stage_spill_bytes_written(),
             peak_consumer_usage_bytes: memory.peak_consumer_usage(),
             per_node_peak_charged_bytes: memory.per_node_peak_charged_bytes(),
+            memory_limit_bytes: memory.ledger_capacity(),
         })
     }
 }
@@ -271,6 +277,9 @@ struct RunExecutionContext<'a> {
 struct DagExecResources {
     writer_resources: clinker_format::preparation::WriterResources,
     allocation_resources: clinker_record::owned_storage::AllocationResources,
+    /// Builds the allocation view each activated body Source reads through,
+    /// charged in that Source's name.
+    allocation_attribution: preparation::AllocationAttribution,
     /// Executor-owned sealed Source capabilities for body activation.
     source_activation: Option<source_activation::SourceActivationController>,
     /// One live crossbeam `Receiver` per declared Source, drained by
@@ -283,8 +292,9 @@ struct DagExecResources {
     /// consumer, keyed by Source node name in lockstep with
     /// `source_records`. The dispatch arm that takes a source's receiver
     /// out of `source_records` also owns this entry and releases it at
-    /// receiver disconnect, so a drained source's queue estimate leaves
-    /// `sum_consumer_usage` instead of freezing until arbitrator drop.
+    /// receiver disconnect, so a drained source's per-attempt queued charge
+    /// leaves the ledger total `sum_consumer_usage` reads instead of
+    /// freezing until arbitrator drop.
     source_consumers: HashMap<
         String,
         (
@@ -679,9 +689,14 @@ impl PipelineExecutor {
         // The run boundary is where a bad `memory.limit` becomes a user-facing
         // error: an unparseable value falls back to the default budget, but a
         // value whose binary-suffix scaling overflows `u64` fails the run here
-        // with a config diagnostic instead of panicking or wrapping. Every
-        // downstream consumer (arbitrator, dispatch budgets) re-reads the same
-        // validated string, so this gate keeps them overflow-free.
+        // with a config diagnostic instead of panicking or wrapping. The
+        // arbitrator re-reads the same validated string, and every runtime
+        // budget reads the arbitrator, so this gate keeps them overflow-free.
+        //
+        // The check judges the configured `memory.limit`, never a test ledger
+        // capacity: a test holds the run to a small capacity precisely so its
+        // limit stays satisfiable. The baseline is an injected figure when a
+        // test supplies one, else a fresh measurement.
         let configured_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
             config.pipeline.memory.limit.as_deref(),
         )
@@ -689,9 +704,10 @@ impl PipelineExecutor {
         crate::pipeline::memory::reject_unsatisfiable_budget(
             configured_limit,
             config.pipeline.memory.backpressure,
+            params.memory_test.baseline_rss().or_else(rss_bytes),
         )?;
 
-        let arbitrator = build_arbitrator_from_config(config);
+        let arbitrator = build_arbitrator_from_config(config, &params.memory_test)?;
         // Fold the workspace `storage.spill.disk_cap_bytes` quota into the
         // arbitrator's disk-spill ceiling. Absent config leaves the cap at
         // its `u64::MAX` (unlimited) default, so behavior is unchanged when
@@ -1074,14 +1090,12 @@ impl PipelineExecutor {
                 })?;
                 // Single ConsumerHandle shared between the SourceConsumer
                 // wrapper (BackPressurePreferred / Priority pause target)
-                // and the SourceIngestChannel that mirrors the channel queue
-                // depth × per-record bytes into the handle's counter on
-                // every `push`. The registration travels with the receiver:
-                // whichever dispatch arm drains this source's channel releases
-                // the wrapper at receiver disconnect, so a drained source
-                // stops contributing its last queue estimate to
-                // `sum_consumer_usage` — downstream spill / abort decisions
-                // would otherwise keep seeing bytes that already moved on.
+                // and the SourceIngestChannel, whose queued attempts each
+                // carry their unadmitted heap as a charge on it until they
+                // leave the channel. The registration travels with the
+                // receiver: whichever dispatch arm drains this source's
+                // channel releases the wrapper at receiver disconnect, so a
+                // drained source leaves the registry the policies poll.
                 let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
                 let source_body = validated_plan
                     .config()
@@ -1119,6 +1133,21 @@ impl PipelineExecutor {
                     .pipeline
                     .batch_size
                     .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
+                // Registered before its stream exists so every record the
+                // stream allocates is charged in this Source's name.
+                let source_consumer_id = memory_budget.register_node_consumer(
+                    Arc::new(crate::executor::source_stream::SourceConsumer::new(
+                        Arc::clone(&source_consumer_handle),
+                    )),
+                    Arc::clone(&source_consumer_handle),
+                    clinker_plan::runtime_error::ConsumerLabel {
+                        node: src_cfg.name.clone(),
+                        surface: clinker_plan::runtime_error::MemorySurface::RowsRead,
+                    },
+                );
+                let source_allocation = writer_provider.attributed_allocation(
+                    crate::pipeline::memory::ledger::Requester::for_consumer(source_consumer_id),
+                );
                 let (stream, rx) = match order_config {
                     Some(order_config) => {
                         crate::executor::source_stream::SourceIngestChannel::new_ordered(
@@ -1131,22 +1160,18 @@ impl PipelineExecutor {
                             params
                                 .spill_compress
                                 .resolve_for_schema(source_column_count, source_batch_size as u64),
-                            allocation_resources.clone(),
+                            source_allocation,
                         )
                     }
                     None => crate::executor::source_stream::SourceIngestChannel::new(
                         crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
                         source_consumer_handle.clone(),
                         source_id,
-                        allocation_resources.clone(),
+                        source_allocation,
                     ),
                 };
-                let source_consumer_id = memory_budget.register_node_consumer(
-                    &src_cfg.name,
-                    Arc::new(crate::executor::source_stream::SourceConsumer::new(
-                        Arc::clone(&source_consumer_handle),
-                    )),
-                );
+                #[cfg(test)]
+                stream.assert_allocation_domain(&allocation_resources);
                 source_records.insert(src_cfg.name.clone(), rx);
                 source_consumers.insert(
                     src_cfg.name.clone(),
@@ -1215,6 +1240,7 @@ impl PipelineExecutor {
             DagExecResources {
                 writer_resources,
                 allocation_resources,
+                allocation_attribution: writer_provider.attribution(),
                 source_activation,
                 source_records,
                 source_consumers,
@@ -1272,6 +1298,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes_written,
             peak_consumer_usage_bytes,
             per_node_peak_charged_bytes,
+            memory_limit_bytes,
         } = SourceCompletion::join(&memory_budget, || {
             ingest::join_source_workers(ingest_handles, "source-ingest-thread")
         })?;
@@ -1381,6 +1408,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes_written,
             peak_consumer_usage_bytes,
             per_node_peak_charged_bytes,
+            memory_limit_bytes,
             interrupted,
             advisories,
         })
@@ -1466,6 +1494,7 @@ impl PipelineExecutor {
         let DagExecResources {
             writer_resources,
             allocation_resources,
+            allocation_attribution,
             source_activation,
             source_records,
             source_consumers,
@@ -1784,10 +1813,17 @@ impl PipelineExecutor {
             // #301. Matches `admit_node_buffer`'s posture.
             let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
             let charge_consumer_id = memory_budget.register_node_consumer(
-                &spec.producer_name,
                 Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
                     charge_handle.clone(),
                 )),
+                charge_handle.clone(),
+                clinker_plan::runtime_error::ConsumerLabel {
+                    node: spec.producer_name.clone(),
+                    surface: clinker_plan::runtime_error::MemorySurface::BufferedRows {
+                        from: spec.producer_name.clone(),
+                        to: spec.output_name.clone(),
+                    },
+                },
             );
             let writer_charge_handle = charge_handle.clone();
             let telemetry_producer = params.telemetry_producer.clone();
@@ -1824,6 +1860,7 @@ impl PipelineExecutor {
         let mut ctx = dispatch::ExecutorContext {
             writer_resources,
             allocation_resources,
+            allocation_attribution,
             config,
             composition_bodies,
             sink_configs: &sink_configs,
@@ -2038,14 +2075,14 @@ impl PipelineExecutor {
         // Sources the walk never drained — an error unwind or an interrupt
         // before their dispatch turn — still hold their ingest-channel
         // registration. Release them here so the registry does not outlive
-        // the walk with a frozen queue estimate summed in. On a completed
+        // the walk with a frozen queued charge on the ledger. On a completed
         // walk this map is empty: each drain arm released its entry at
         // receiver disconnect. `resume` before unregister is load-bearing:
         // an arbitration round may have paused an undrained source's ingest
         // thread, and once the wrapper leaves the registry nothing else can
         // unpark it — the thread would sit parked forever and the caller's
         // ingest-thread join would hang. `set_bytes(0)` keeps the shared
-        // handle's mirrored estimate truthful; the unregister is what drops
+        // handle's ledger charge truthful; the unregister is what drops
         // the consumer out of `sum_consumer_usage`.
         for (_, (id, handle)) in std::mem::take(&mut ctx.source_consumers) {
             handle.resume();
