@@ -972,6 +972,23 @@ allocations remain outside that writer guarantee, and EDIFACT, X12 and HL7
 writer migration remains outstanding. AUTH-06 is still partial. See
 [physical-text ownership](../engine/src/memory-arbitration.md#physical-text-configuration-truncation-tallies-and-trailers).
 
+### 91. A group that mixes decimals and floats
+
+Resolved 2026-09-29 by maintainer decision (one numeric rule for the
+aggregates). `sum` used to return the decimal total without the floats, and
+`avg` and `weighted_avg` null. Now a `sum`, `avg` or `weighted_avg` group
+holding both a decimal and a float fails with the typed
+`AccumulatorError::MixedDecimalFloat`, whose message gives the conversion to
+paste, through the `aggregate_finalize` path. The domain comes from one
+count-derived classifier, `NumericDomain`, that the three finalizers match
+exhaustively, so a silent drop or a substitute null cannot be written
+(`crates/clinker-record/src/accumulator/mod.rs`). At compile time every `if`,
+`match` and `??` whose branches are a decimal and a float is an E200 naming
+the branches and the fix (`crates/cxl/src/typecheck/pass.rs`), so the mix
+reaches an aggregate only through a value typecheck cannot see (an untyped
+column, a `numeric` result such as `decimal.clamp(lo, hi)`), where the
+run-time error is the backstop. See `docs/user/src/cxl/aggregates.md`.
+
 Numbers are never reused. One line per entry: the answer and its evidence.
 
 - **2 (partial, `fixed` lock; resolved 2026-07-03):** The folder overlay carries

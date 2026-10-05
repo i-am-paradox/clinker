@@ -78,9 +78,11 @@ pub enum HashAggError {
     /// generic internal error.
     #[error("{0}")]
     SpillDir(SpillError),
-    /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). Routed
-    /// to `PipelineError::Accumulator` by the 16.3.13 dispatch arm.
-    #[error("aggregate {transform}.{binding}: accumulator finalize failed: {source:?}")]
+    /// An accumulator's `finalize()` failed (e.g. `SumOverflow`). `binding`
+    /// is the author's `emit` that reads the accumulator. Routed to
+    /// `PipelineError::Accumulator` by the executor's dispatch arms; the
+    /// message renders the error's readable form, which carries its fix.
+    #[error("aggregate {transform}.{binding}: accumulator finalize failed: {source}")]
     Accumulator {
         transform: String,
         binding: String,
@@ -120,8 +122,8 @@ pub enum HashAggError {
     },
     /// A single input record's buffered contributions alone exceed the entire
     /// memory budget. Buffer-mode aggregation must hold every raw
-    /// contribution resident to recompute `BufferRequired` bindings (`min`,
-    /// `max`, `avg`) after a retraction, so a row larger than the whole
+    /// contribution resident to recompute `BufferRequired` bindings (`min`
+    /// and `max`) after a retraction, so a row larger than the whole
     /// budget has no in-budget representation and spilling cannot rescue it —
     /// the next add of the same shape repeats the overflow. Routed by the
     /// executor dispatch arm by error strategy: `FailFast` surfaces `E310

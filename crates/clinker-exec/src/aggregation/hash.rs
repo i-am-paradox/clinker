@@ -600,19 +600,17 @@ impl HashAggregator {
                     CompiledBindingArg::Pair(a, b) => {
                         let va = eval_binding_arg_value(a, record, ctx)?;
                         let vb = eval_binding_arg_value(b, record, ctx)?;
-                        // Lineage + Pair only co-occur on a relaxed-CK
-                        // aggregate whose only Pair binding is
-                        // WeightedAvg, which is BufferRequired and would
-                        // route through buffer-mode instead. The branch
-                        // is kept defensively so a future Pair binding
-                        // that enters the Reversible set does not break
-                        // here.
+                        // A WeightedAvg binding is reversible, so a
+                        // relaxed aggregate retracts it on this path: cache
+                        // both operands for `retract_row`'s `sub_weighted`,
+                        // and count the heap the add allocates, which the
+                        // retraction gives back.
                         row_heap_bytes = row_heap_bytes
                             .saturating_add(va.heap_size())
                             .saturating_add(vb.heap_size());
                         row_values.push(va.clone());
                         row_values.push(vb.clone());
-                        acc.add_weighted(&va, &vb);
+                        delta += acc.add_weighted(&va, &vb);
                     }
                     CompiledBindingArg::Field(idx) => {
                         let v = record
@@ -869,15 +867,16 @@ impl HashAggregator {
     /// (buffer-mode), then walks back the row's contribution:
     ///
     /// * **Lineage / fold path** — for each binding's accumulator in the
-    ///   group, calls `acc.sub(&stored_value)` against the corresponding
-    ///   slot in `AggregatorGroupState.retract_values`. Reversible-only
+    ///   group, calls `acc.sub(&stored_value)` (`sub_weighted` for a
+    ///   `weighted_avg` pair) against the corresponding slot in
+    ///   `AggregatorGroupState.retract_values`. Reversible-only
     ///   bindings are guaranteed by `set_retraction_flags`.
     /// * **Buffer path** — removes the matching entry from
     ///   `BufferedGroupState.contributions`/`input_rows`. The next
     ///   `finalize` call re-folds the surviving contributions through a
-    ///   fresh accumulator row, so `BufferRequired` bindings (`Min`,
-    ///   `Max`, `Avg`, `WeightedAvg`) recompute byte-identically to a
-    ///   feed-from-scratch over the surviving rows.
+    ///   fresh accumulator row, so `BufferRequired` bindings (`Min` and
+    ///   `Max`) recompute byte-identically to a feed-from-scratch over the
+    ///   surviving rows.
     ///
     /// Both paths return [`HashAggError::Spill`] when the row id is not
     /// found in any in-memory group; spilled groups cannot be retracted
@@ -941,12 +940,9 @@ impl HashAggregator {
             for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
                 match &binding.arg {
                     BindingArg::Pair(_, _) => {
-                        // Lineage + Pair only co-occurs through the
-                        // defensive branch in `add_record`; today every
-                        // Pair-shaped binding (`WeightedAvg`) is
-                        // BufferRequired and runs through the buffer
-                        // arm above.
-                        debug_assert!(false, "Pair binding under lineage path is unreachable");
+                        let v = values.get(value_cursor).cloned().unwrap_or(Value::Null);
+                        let w = values.get(value_cursor + 1).cloned().unwrap_or(Value::Null);
+                        total_delta += acc.sub_weighted(&v, &w);
                         value_cursor += 2;
                     }
                     _ => {
@@ -1435,12 +1431,14 @@ pub(crate) fn finalize_group_inner(
     key: &[GroupByKey],
     state: &AggregatorGroupState,
 ) -> Result<Record, HashAggError> {
-    let bindings = factory.bindings();
     let mut slots: Vec<Value> = Vec::with_capacity(state.row.len());
     for (i, acc) in state.row.iter().enumerate() {
+        // The failure names the author's `emit`, which a dead-letter reason
+        // and a run error show the author; the binding's own label is engine
+        // vocabulary.
         let v = acc.finalize().map_err(|e| HashAggError::Accumulator {
             transform: transform_name.to_string(),
-            binding: bindings[i].output_name.to_string(),
+            binding: factory.compiled().author_name_of_binding(i).to_string(),
             source: e,
         })?;
         slots.push(v);
@@ -2112,7 +2110,7 @@ mod spill_trigger_tests {
     //
     // The buffer-mode path is the complement of the lineage path under
     // relaxed-correlation-key semantics: when at least one binding is
-    // BufferRequired (Min/Max/Avg/WeightedAvg), the aggregator holds
+    // BufferRequired (Min/Max), the aggregator holds
     // raw per-row contributions instead of folded accumulator state so
     // the rollback step can recompute affected groups from
     // `contributions − retracted_rows`. The fold-mode path stays the
@@ -2574,8 +2572,10 @@ mod spill_trigger_tests {
 
     // ----------------------------------------------------------------
     // Buffer-mode retract round-trip — feed N, retract M, finalize_in_place
-    // equals feed-(N-M)-from-scratch byte-identically. One test per
-    // BufferRequired variant: Min, Max, Avg, WeightedAvg.
+    // equals feed-(N-M)-from-scratch byte-identically. Buffer mode is
+    // selected by the BufferRequired variants, Min and Max; avg and
+    // weighted_avg retract by subtraction on the lineage path, and run in
+    // buffer mode here only because they sit beside a `min` binding.
     // ----------------------------------------------------------------
 
     fn run_with_retract<F>(
@@ -2733,7 +2733,7 @@ mod spill_trigger_tests {
             (vec![Value::String("g".into()), Value::Float(3.0)], 2),
         ];
         let (after, baseline) = run_with_retract(
-            "emit k = k\nemit a = avg(v)",
+            "emit k = k\nemit lo = min(v)\nemit a = avg(v)",
             &[("k", Type::String), ("v", Type::Float)],
             &["k"],
             &rows,
@@ -2743,6 +2743,130 @@ mod spill_trigger_tests {
         assert!(
             record_set_eq(&after, &baseline),
             "Avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    /// Whether two finalized outputs are identical to the last bit, floats
+    /// included: the lineage path subtracts exactly, so a retracted run must
+    /// not differ from a fresh fold by even one ulp.
+    fn records_bit_identical(a: &[Record], b: &[Record]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(ra, rb)| {
+                ra.values().len() == rb.values().len()
+                    && ra
+                        .values()
+                        .iter()
+                        .zip(rb.values().iter())
+                        .all(|(x, y)| match (x, y) {
+                            (Value::Float(fx), Value::Float(fy)) => fx.to_bits() == fy.to_bits(),
+                            (Value::Integer(ix), Value::Integer(iy)) => ix == iy,
+                            (Value::String(sx), Value::String(sy)) => sx == sy,
+                            (Value::Null, Value::Null) => true,
+                            _ => false,
+                        })
+            })
+    }
+
+    #[test]
+    fn test_lineage_retract_avg_matches_refold() {
+        let rows = vec![
+            (vec![Value::String("g".into()), Value::Float(0.1)], 0),
+            (vec![Value::String("g".into()), Value::Float(0.2)], 1),
+            (vec![Value::String("g".into()), Value::Float(0.7)], 2),
+            (vec![Value::String("g".into()), Value::Float(1e17)], 3),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit a = avg(v)",
+            &[("k", Type::String), ("v", Type::Float)],
+            &["k"],
+            &rows,
+            &[3],
+            |all| all.iter().filter(|(_, rn)| *rn != 3).cloned().collect(),
+        );
+        assert!(
+            records_bit_identical(&after, &baseline),
+            "lineage avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    #[test]
+    fn test_lineage_retract_weighted_avg_matches_refold() {
+        let rows = vec![
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(0.1),
+                    Value::Float(0.3),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(0.2),
+                    Value::Float(0.7),
+                ],
+                1,
+            ),
+            (
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(1e17),
+                    Value::Float(3.0),
+                ],
+                2,
+            ),
+        ];
+        let (after, baseline) = run_with_retract(
+            "emit k = k\nemit wa = weighted_avg(v, w)",
+            &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
+            &["k"],
+            &rows,
+            &[2],
+            |all| all.iter().filter(|(_, rn)| *rn != 2).cloned().collect(),
+        );
+        assert!(
+            records_bit_identical(&after, &baseline),
+            "lineage weighted_avg retract: {after:?} != {baseline:?}"
+        );
+    }
+
+    /// A strict (not relaxed) aggregator folds a `weighted_avg` through
+    /// `dispatch_binding`, and its two exact-sum states are charged: a group
+    /// held for the table's whole life must not look free to the arbitrator.
+    #[test]
+    fn test_strict_weighted_avg_charges_both_exact_sum_states() {
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let input = make_schema(&["k", "v", "w"]);
+        let mut agg = build_test_aggregator_relaxed(
+            &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
+            &["k"],
+            "emit k = k\nemit wa = weighted_avg(v, w)",
+            10 * 1024 * 1024,
+            None,
+            false,
+        );
+        let before = agg.value_heap_bytes();
+        agg.add_record(
+            &make_record(
+                &input,
+                vec![
+                    Value::String("g".into()),
+                    Value::Float(1.0),
+                    Value::Float(2.0),
+                ],
+            ),
+            0,
+            &ctx_for(&stable, &file, 0),
+        )
+        .expect("add_record");
+        let one_state = clinker_record::accumulator::ExactSum::new().add_f64(1.0);
+        assert!(
+            agg.value_heap_bytes() - before >= 2 * one_state,
+            "weighted_avg holds a value state and a weight state; charged {} bytes, \
+             each exact sum is {one_state}",
+            agg.value_heap_bytes() - before
         );
     }
 
@@ -2775,7 +2899,7 @@ mod spill_trigger_tests {
             ),
         ];
         let (after, baseline) = run_with_retract(
-            "emit k = k\nemit wa = weighted_avg(v, w)",
+            "emit k = k\nemit lo = min(v)\nemit wa = weighted_avg(v, w)",
             &[("k", Type::String), ("v", Type::Float), ("w", Type::Float)],
             &["k"],
             &rows,

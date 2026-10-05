@@ -100,8 +100,8 @@ pub struct CompiledAggregate {
     /// retract individual contributions without rerunning the whole
     /// stream. Derived from whether the aggregate's `group_by` omits
     /// any correlation-key field plus the reversibility of every
-    /// binding's accumulator — any `BufferRequired` binding
-    /// short-circuits this back to `false` because that path will
+    /// binding's accumulator — any `BufferRequired` binding (`min` or
+    /// `max`) short-circuits this back to `false` because that path will
     /// replay surviving rows from a separate per-group buffer instead
     /// of running the lineage-driven retract. Strict aggregates
     /// (`group_by ⊇ correlation_key`, or no correlation key) always set
@@ -112,10 +112,11 @@ pub struct CompiledAggregate {
     /// aggregate's `group_by` omits any correlation-key field plus the
     /// reversibility of every binding's accumulator — exactly the
     /// complement of the lineage gate: at least one `BufferRequired`
-    /// binding (`Min`, `Max`, `Avg`, `WeightedAvg`) flips this on so the
-    /// rollback step can recompute affected groups from
-    /// `contributions − retracted_rows` rather than rely on an O(1)
-    /// inverse op the accumulator does not admit. Strict aggregates
+    /// binding (`Min` or `Max`) flips this on so the rollback step can
+    /// recompute affected groups from `contributions − retracted_rows`
+    /// rather than rely on an inverse op those accumulators do not admit
+    /// (`Sum`, `Avg` and `WeightedAvg` hold exact sums, which subtract
+    /// exactly, so they stay on the lineage path). Strict aggregates
     /// (`group_by ⊇ correlation_key`, or no correlation key) always set
     /// this `false`.
     pub requires_buffer_mode: bool,
@@ -149,4 +150,45 @@ impl CompiledAggregate {
         self.requires_lineage = !any_buffer_required;
         self.requires_buffer_mode = any_buffer_required;
     }
+
+    /// The author's name for binding `slot`: the first `emit`, in authored
+    /// order, whose residual reads that accumulator. A diagnostic about one
+    /// accumulator names this rather than the binding's engine label, which
+    /// is not author vocabulary. Falls back to the engine label only for a
+    /// binding no emit reads, which extraction never produces. Walks each
+    /// emit's residual until one matches; allocates nothing.
+    pub fn author_name_of_binding(&self, slot: usize) -> &str {
+        self.emits
+            .iter()
+            .find(|emit| reads_slot(&emit.residual, slot))
+            .map_or_else(
+                || self.bindings[slot].output_name.as_ref(),
+                |emit| emit.output_name.as_ref(),
+            )
+    }
+}
+
+/// Whether `expr` reads accumulator slot `slot` anywhere beneath it.
+fn reads_slot(expr: &Expr, slot: usize) -> bool {
+    struct Finder {
+        slot: usize,
+        found: bool,
+    }
+    impl crate::analyzer::visitor::Visitor for Finder {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::AggSlot { slot, .. } = expr
+                && *slot as usize == self.slot
+            {
+                self.found = true;
+                return;
+            }
+            crate::analyzer::visitor::walk_expr(self, expr);
+        }
+    }
+    let mut finder = Finder { slot, found: false };
+    crate::analyzer::visitor::Visitor::visit_expr(&mut finder, expr);
+    finder.found
 }

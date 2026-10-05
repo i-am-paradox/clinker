@@ -34,6 +34,26 @@ $ cxl eval -e 'emit bonus = if score > 90 then score * 0.1' \
 }
 ```
 
+### Branches of one numeric type
+
+The two branches of an `if` must not be a decimal and a float, because the
+result would be a decimal on some rows and a float on others. Such an `if` does
+not compile:
+
+```text
+cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal in its Source schema, `type: decimal` in place of `type: float`, so the branches have one numeric type
+```
+
+The message gives one fix. When the float branch is a Source column, it is
+the column's schema type: declare `price` with `type: decimal` in place of
+`type: float`, and the reader parses its text exactly, so both branches are
+decimals holding the values the file holds. (A JSON number read into a
+`decimal` column is still parsed through a float first; see [#1299](https://github.com/rustpunk/clinker/issues/1299).)
+When the float branch is computed rather than read from a Source column, the
+fix converts the decimal branch with `.to_float()` instead, accepting binary
+float precision. An integer branch is fine beside either: it widens exactly
+into the decimal or float.
+
 ### Chained conditionals
 
 Chain multiple conditions with `else if`:
@@ -168,6 +188,14 @@ emit region = match country {
   _    => "Other"
 }
 ```
+
+### Arms of one numeric type
+
+As with `if`, the arms of a `match` must not include both a decimal and a
+float. The error names the first decimal arm and the first float arm, counted
+from 1, or the field when an arm is a bare field, and gives the same one fix:
+the Source schema type when the float arm is a float column, otherwise
+`.to_float()` on the decimal arm.
 
 ### Match arms are evaluated in order
 

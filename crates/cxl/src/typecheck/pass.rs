@@ -12,6 +12,45 @@ use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
 use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
 
+/// A construct whose result is one of several branch expressions, so the
+/// branches must share one type.
+#[derive(Debug, Clone, Copy)]
+enum BranchJoin {
+    If,
+    Match,
+    Coalesce,
+}
+
+impl BranchJoin {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::If => "if",
+            Self::Match => "match",
+            Self::Coalesce => "??",
+        }
+    }
+
+    /// What the construct's branches are called, plural and singular.
+    fn branch_words(self) -> (&'static str, &'static str) {
+        match self {
+            Self::If => ("branches", "branch"),
+            Self::Match => ("arms", "arm"),
+            Self::Coalesce => ("sides", "side"),
+        }
+    }
+
+    /// The branch at `index`, named by its position.
+    fn position(self, index: usize) -> String {
+        match (self, index) {
+            (Self::If, 0) => "the `then` branch".into(),
+            (Self::If, _) => "the `else` branch".into(),
+            (Self::Match, n) => format!("arm {}", n + 1),
+            (Self::Coalesce, 0) => "the left side".into(),
+            (Self::Coalesce, _) => "the right side".into(),
+        }
+    }
+}
+
 /// Return type inference for aggregate function calls.
 ///
 /// - `sum(Integer)` → Integer, `sum(Float)` → Float, `sum(Numeric/Any)` → Numeric
@@ -422,6 +461,99 @@ impl<'a> TypeChecker<'a> {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).cloned())
+    }
+
+    /// Reject a join of branches whose types, nullability stripped, include
+    /// both a decimal and a float: a decimal never mixes with a float without
+    /// an explicit conversion, whether through an operator or through the
+    /// branches of an `if`, `match` or `??`. Returns whether it rejected, so
+    /// the caller types the join as `Any` and raises no second diagnostic.
+    ///
+    /// The message gives one fix. When the float branch is an input column
+    /// whose type the Source schema declares, the fix is to declare that
+    /// column a decimal: the reader then parses the text exactly, so the
+    /// author's values are kept and the join is exact. Otherwise there is no
+    /// column to retype, and the fix converts the decimal side with
+    /// `.to_float()`. No fix converts a float to a decimal, which would keep
+    /// the float's binary digits and change the author's values.
+    ///
+    /// `Numeric` against a decimal stays permissive, as in binary operators: it
+    /// may be an integer at run time, and the aggregates' run-time rule covers
+    /// what typecheck cannot see. The fix goes in the message rather than in
+    /// `help`, which the pipeline's compile diagnostic does not show.
+    fn reject_decimal_float_join(
+        &mut self,
+        span: Span,
+        join: BranchJoin,
+        branches: &[(&Expr, &Type)],
+    ) -> bool {
+        let find = |wanted: &Type| {
+            branches
+                .iter()
+                .position(|(_, ty)| ty.unwrap_nullable() == wanted)
+                .map(|index| (index, branches[index].0))
+        };
+        let (Some(decimal), Some(float)) = (find(&Type::Decimal), find(&Type::Float)) else {
+            return false;
+        };
+        let label = |(index, expr): (usize, &Expr)| match expr {
+            Expr::FieldRef { name, .. } => format!("`{name}`"),
+            _ => join.position(index),
+        };
+        let (plural, singular) = join.branch_words();
+        let fix = match self.declared_input_column(float.1) {
+            Some(column) => {
+                let (to, from) = if branches[float.0].1.is_nullable() {
+                    ("type: { nullable: decimal }", "type: { nullable: float }")
+                } else {
+                    ("type: decimal", "type: float")
+                };
+                format!(
+                    "declare `{column}` a decimal in its Source schema, `{to}` in place of \
+                     `{from}`"
+                )
+            }
+            None => {
+                let decimal_fix = match decimal.1 {
+                    Expr::FieldRef { name, .. } => format!("`{name}.to_float()`"),
+                    _ => "`.to_float()`".to_string(),
+                };
+                format!("convert the decimal {singular} with {decimal_fix}")
+            }
+        };
+        self.error(
+            span,
+            format!(
+                "cannot mix decimal and float without an explicit cast: the {plural} of this \
+                 `{keyword}` are a decimal ({decimal_label}) and a float ({float_label}); \
+                 {fix}, so the {plural} have one numeric type",
+                keyword = join.keyword(),
+                decimal_label = label(decimal),
+                float_label = label(float),
+            ),
+            None,
+        );
+        true
+    }
+
+    /// The column `expr` reads when it is a bare reference to an input column
+    /// whose type the schema declares, and not a lexical name, a `let`
+    /// binding or any other value: the same tests the `FieldRef` typing arm
+    /// applies before it reads a column's declared type.
+    fn declared_input_column(&self, expr: &Expr) -> Option<String> {
+        let Expr::FieldRef { node_id, name, .. } = expr else {
+            return None;
+        };
+        if self.lexical_type(name).is_some() {
+            return None;
+        }
+        let binding = self
+            .bindings
+            .get(node_id.0 as usize)
+            .and_then(|b| b.as_ref());
+        let declared = matches!(binding, Some(ResolvedBinding::Field(_)))
+            && matches!(self.schema.lookup(name), ColumnLookup::Declared(_));
+        declared.then(|| name.to_string())
     }
 
     fn error(&mut self, span: Span, message: String, help: Option<String>) {
@@ -862,13 +994,24 @@ impl<'a> TypeChecker<'a> {
             }
 
             Expr::Coalesce {
-                node_id, lhs, rhs, ..
+                node_id,
+                lhs,
+                rhs,
+                span,
             } => {
                 let lt = self.check_expr(lhs, in_predicate);
                 let rt = self.check_expr(rhs, in_predicate);
                 // Coalesce strips nullability from left operand
                 let inner = lt.unwrap_nullable();
-                let ty = inner.unify(&rt).unwrap_or(rt);
+                let ty = if self.reject_decimal_float_join(
+                    *span,
+                    BranchJoin::Coalesce,
+                    &[(lhs.as_ref(), &lt), (rhs.as_ref(), &rt)],
+                ) {
+                    Type::Any
+                } else {
+                    inner.unify(&rt).unwrap_or(rt)
+                };
                 self.set_type(*node_id, ty.clone());
                 ty
             }
@@ -878,13 +1021,21 @@ impl<'a> TypeChecker<'a> {
                 condition,
                 then_branch,
                 else_branch,
-                ..
+                span,
             } => {
                 self.check_expr(condition, in_predicate);
                 let then_ty = self.check_expr(then_branch, in_predicate);
                 let ty = if let Some(eb) = else_branch {
                     let else_ty = self.check_expr(eb, in_predicate);
-                    then_ty.unify(&else_ty).unwrap_or(Type::Any)
+                    if self.reject_decimal_float_join(
+                        *span,
+                        BranchJoin::If,
+                        &[(then_branch.as_ref(), &then_ty), (eb.as_ref(), &else_ty)],
+                    ) {
+                        Type::Any
+                    } else {
+                        then_ty.unify(&else_ty).unwrap_or(Type::Any)
+                    }
                 } else {
                     // Missing else → result could be Null
                     Type::nullable(then_ty)
@@ -916,10 +1067,19 @@ impl<'a> TypeChecker<'a> {
                 }
 
                 let mut result_ty = Type::Any;
+                let mut body_types = Vec::with_capacity(arms.len());
                 for arm in arms {
+                    // A pattern is compared with the subject, not joined with
+                    // the other arms, so only the bodies are branches.
                     self.check_expr(&arm.pattern, in_predicate);
                     let body_ty = self.check_expr(&arm.body, in_predicate);
                     result_ty = result_ty.unify(&body_ty).unwrap_or(Type::Any);
+                    body_types.push(body_ty);
+                }
+                let branches: Vec<(&Expr, &Type)> =
+                    arms.iter().map(|arm| &arm.body).zip(&body_types).collect();
+                if self.reject_decimal_float_join(*span, BranchJoin::Match, &branches) {
+                    result_ty = Type::Any;
                 }
                 self.set_type(*node_id, result_ty.clone());
                 result_ty
@@ -1237,8 +1397,9 @@ impl<'a> TypeChecker<'a> {
                             // total. `Numeric` admits `Float` at runtime and
                             // does not unify with `Decimal` (see `Type::unify`),
                             // so it is rejected against a decimal too; `Any`
-                            // stays permissive here and is poisoned to Null at
-                            // runtime if it resolves to a conflicting mix.
+                            // stays permissive here, and a group that turns out
+                            // to mix the two fails at run time with the
+                            // aggregate's decimal-and-float error.
                             let has_decimal = arg_types
                                 .iter()
                                 .any(|t| matches!(t.unwrap_nullable(), Type::Decimal));
@@ -3810,5 +3971,267 @@ mod tests {
             !parsed.errors.is_empty(),
             "expected a parse diagnostic for an oversized integer literal"
         );
+    }
+
+    // ── decimal and float branch joins ─────────────────────────────────
+
+    const MIX: &str = "cannot mix decimal and float without an explicit cast";
+
+    /// Typecheck `src` against `amount: decimal, price: float, qty: int,
+    /// flag: bool` in `mode`.
+    fn typecheck_mixed(
+        src: &str,
+        mode: AggregateMode,
+    ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+        typecheck_mixed_with_price(src, mode, Type::Float)
+    }
+
+    /// [`typecheck_mixed`] with `price` declared `price`.
+    fn typecheck_mixed_with_price(
+        src: &str,
+        mode: AggregateMode,
+        price: Type,
+    ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+        let fields = ["amount", "price", "qty", "flag"];
+        let parsed = Parser::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved =
+            resolve_program(parsed.ast, &fields, parsed.node_count).unwrap_or_else(|d| {
+                panic!(
+                    "Resolve errors: {:?}",
+                    d.iter().map(|e| &e.message).collect::<Vec<_>>()
+                )
+            });
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("price".into(), price);
+        cols.insert("qty".into(), Type::Int);
+        cols.insert("flag".into(), Type::Bool);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        type_check_with_mode(resolved, &schema, mode)
+    }
+
+    /// The diagnostics of a program the typechecker must reject.
+    fn mixed_err(src: &str, mode: AggregateMode) -> Vec<TypeDiagnostic> {
+        typecheck_mixed(src, mode).expect_err(&format!("expected {src} to be rejected"))
+    }
+
+    #[test]
+    fn decimal_float_branch_join_is_rejected_in_every_context() {
+        for src in [
+            "emit v = if flag then amount else price",
+            "emit v = if flag then price else amount",
+            "emit v = match { flag => amount, _ => price }",
+            "emit v = amount ?? price",
+            "emit v = price ?? amount",
+            "emit v = if flag then amount else if qty > 0 then qty else price",
+            "emit v = (if flag then amount) ?? price",
+        ] {
+            let errs = mixed_err(src, AggregateMode::Row);
+            assert!(
+                errs.iter().any(|d| d.message.starts_with(MIX)),
+                "{src}: {:?}",
+                errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_of_a_decimal_float_branch_join_is_rejected() {
+        let joins = [
+            "if flag then amount else price",
+            "if flag then price else amount",
+            "match { flag => amount, _ => price }",
+            "match { flag => price, _ => amount }",
+            "amount ?? price",
+            "price ?? amount",
+        ];
+        for join in joins {
+            for call in [
+                format!("sum({join})"),
+                format!("avg({join})"),
+                format!("weighted_avg({join}, qty)"),
+            ] {
+                let src = format!("emit v = {call}");
+                let errs = mixed_err(&src, agg_mode(&[]));
+                assert_eq!(
+                    errs.len(),
+                    1,
+                    "{src}: exactly one diagnostic, got {:?}",
+                    errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+                );
+                assert!(
+                    errs[0].message.starts_with(MIX),
+                    "{src}: {}",
+                    errs[0].message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_float_join_message_names_the_branches_and_the_fix() {
+        let errs = mixed_err(
+            "emit v = if flag then amount else price",
+            AggregateMode::Row,
+        );
+        assert_eq!(errs.len(), 1);
+        assert_eq!(
+            errs[0].message,
+            "cannot mix decimal and float without an explicit cast: the branches of this \
+             `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal \
+             in its Source schema, `type: decimal` in place of `type: float`, so the \
+             branches have one numeric type"
+        );
+        assert_eq!(errs[0].help, None, "the fix is in the message");
+
+        // A branch that is not a bare field is named by its position. A float
+        // input column gets the schema change; any other float, the
+        // conversion of the decimal side.
+        for (src, decimal, float, fix) in [
+            (
+                "emit v = if flag then amount + 1 else price * 2.0",
+                "a decimal (the `then` branch)",
+                "a float (the `else` branch)",
+                "convert the decimal branch with `.to_float()`,",
+            ),
+            (
+                "emit v = match { flag => 1, qty > 0 => price * 2.0, _ => amount + 1 }",
+                "a decimal (arm 3)",
+                "a float (arm 2)",
+                "convert the decimal arm with `.to_float()`,",
+            ),
+            (
+                "emit v = (amount + 1) ?? price",
+                "a decimal (the left side)",
+                "a float (`price`)",
+                "declare `price` a decimal in its Source schema, `type: decimal` in place of \
+                 `type: float`,",
+            ),
+        ] {
+            let errs = mixed_err(src, AggregateMode::Row);
+            assert_eq!(errs.len(), 1, "{src}");
+            let message = &errs[0].message;
+            assert!(
+                message.contains(decimal) && message.contains(float),
+                "{src}: {message}"
+            );
+            assert!(message.contains(fix), "{src}: {message}");
+        }
+    }
+
+    #[test]
+    fn decimal_float_join_on_a_nullable_float_column_prints_the_nullable_schema_type() {
+        let typed = typecheck_mixed_with_price(
+            "emit v = if flag then amount else price",
+            AggregateMode::Row,
+            Type::nullable(Type::Float),
+        );
+        let errs = typed.expect_err("a nullable float column still mixes with a decimal");
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].message.contains(
+                "declare `price` a decimal in its Source schema, \
+                 `type: { nullable: decimal }` in place of `type: { nullable: float }`,"
+            ),
+            "{}",
+            errs[0].message
+        );
+    }
+
+    #[test]
+    fn decimal_float_join_on_a_float_that_is_not_an_input_column_converts_the_decimal_side() {
+        for src in [
+            "let p = price * 2.0\nemit v = if flag then amount else p",
+            "emit v = if flag then amount else 0.5",
+            "emit v = if flag then amount else price * 2.0",
+        ] {
+            let errs = mixed_err(src, AggregateMode::Row);
+            assert_eq!(errs.len(), 1, "{src}");
+            let message = &errs[0].message;
+            assert!(
+                message.contains("convert the decimal branch with `amount.to_float()`,"),
+                "{src}: {message}"
+            );
+            assert!(
+                !message.contains("Source schema") && !message.contains("type:"),
+                "{src}: a float that is not an input column has no schema to change: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_decimal_float_join_message_converts_a_float_to_a_decimal() {
+        let programs = [
+            "emit v = if flag then amount else price",
+            "emit v = if flag then price else amount",
+            "emit v = match { flag => amount, _ => price }",
+            "emit v = amount ?? price",
+            "emit v = price ?? amount",
+            "emit v = if flag then amount else if qty > 0 then qty else price",
+            "emit v = (if flag then amount) ?? price",
+            "emit v = if flag then amount + 1 else price * 2.0",
+            "emit v = match { flag => 1, qty > 0 => price * 2.0, _ => amount + 1 }",
+            "emit v = (amount + 1) ?? price",
+            "let p = price * 2.0\nemit v = if flag then amount else p",
+            "emit v = if flag then amount else 0.5",
+        ];
+        for src in programs {
+            for errs in [
+                mixed_err(src, AggregateMode::Row),
+                typecheck_mixed_with_price(src, AggregateMode::Row, Type::nullable(Type::Float))
+                    .expect_err(src),
+            ] {
+                for d in &errs {
+                    assert!(!d.message.contains("to_decimal"), "{src}: {}", d.message);
+                }
+            }
+        }
+        for join in ["if flag then amount else price", "price ?? amount"] {
+            for call in [
+                format!("sum({join})"),
+                format!("avg({join})"),
+                format!("weighted_avg({join}, qty)"),
+            ] {
+                let src = format!("emit v = {call}");
+                for d in mixed_err(&src, agg_mode(&[])) {
+                    assert!(!d.message.contains("to_decimal"), "{src}: {}", d.message);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_joins_that_stay_exact_still_typecheck() {
+        for (src, expected) in [
+            ("emit v = if flag then amount else qty", Type::Decimal),
+            (
+                "emit v = if flag then amount else price.to_decimal()",
+                Type::Decimal,
+            ),
+            (
+                "emit v = if flag then amount.to_float() else price",
+                Type::Float,
+            ),
+        ] {
+            let typed = typecheck_mixed(src, AggregateMode::Row).unwrap_or_else(|d| {
+                panic!(
+                    "{src}: {:?}",
+                    d.iter().map(|e| &e.message).collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(first_emit_expr_type(&typed), expected, "{src}");
+        }
+        // A `numeric`-typed branch may be a decimal at run time; typecheck
+        // cannot see it, and the aggregate's run-time rule is the backstop.
+        typecheck_mixed(
+            "emit v = sum(if flag then amount.clamp(0, 100) else price)",
+            agg_mode(&[]),
+        )
+        .unwrap_or_else(|d| panic!("{:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>()));
     }
 }

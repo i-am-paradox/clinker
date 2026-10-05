@@ -19,6 +19,8 @@ triomphe = { workspace = true }
 criterion = { workspace = true }
 clinker-bench-support = { workspace = true }
 postcard = { workspace = true }
+bitrep = { workspace = true }
+num-bigint = { workspace = true }
 
 [[bench]]
 name = "record_ops"

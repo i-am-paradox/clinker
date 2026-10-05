@@ -4,6 +4,109 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — aggregates follow one numeric rule: exact decimal totals, a typed error for every failure, and no decimal–float mixing
+
+This is a breaking change. A numeric aggregate now gives the exact value of its
+definition over the group, rounded once, or fails the group with an error that
+names the rule and the fix; only a group with no non-null value gives null.
+
+- **Decimal totals are exact.** A decimal `sum`, and the sums inside `avg` and
+  `weighted_avg`, are the exact total of the group's values, rounded once (half
+  to even) only when the total does not fit a decimal at the result's scale.
+  Before, each addition rounded as it went, so a total of quotients such as
+  `sum(amount / qty)` could change in its last digits with the order rows
+  arrived in or the way a spilled aggregation split the group. A total that
+  does not fit a decimal at that scale can change in the last digit. The
+  result's scale is the
+  largest scale among the group's values, zeros and integers included, so the
+  sum of `1.00`, `-1.00` and `2` is now `2.00` in every order (it could be
+  `2`). A decimal total is out of range only when the whole group's exact total
+  is; a group whose running total passed outside the range and came back used
+  to fail and now succeeds.
+- **`avg` and `weighted_avg` fail instead of writing null.** A decimal total
+  or quotient outside the decimal range, a `weighted_avg` row whose
+  `value * weight` is out of range, and a `weighted_avg` whose weights total
+  exactly zero (in integer, float and decimal groups alike, as `x / 0` is an
+  error) now fail the group as `aggregate_finalize` instead of writing null.
+  `avg(x)` is `sum(x) / count(x)` and `weighted_avg(v, w)` is
+  `sum(v * w) / sum(w)`, with the same digits and scale.
+- **A group mixing decimals and floats fails.** `sum` used to return the
+  decimal total without the floats, and `avg` and `weighted_avg` wrote null.
+  The group now fails with:
+
+  ```text
+  decimal and float in one group: a decimal is never added to a float without an explicit conversion; declare the column that holds the floats `type: decimal` in its Source schema, so every value in the group is a decimal
+  ```
+
+- **`if`, `match` and `??` over a decimal and a float no longer compile.** They
+  used to type as `any` (or, for `??`, as the right side) and pass the mix on.
+  They are now an E200:
+
+  ```text
+  cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal in its Source schema, `type: decimal` in place of `type: float`, so the branches have one numeric type
+  ```
+
+- **The error's message reaches the author.** The `aggregate_finalize`
+  dead-letter reason and a run that stops on an aggregate error print the
+  error's message with its fix, and name the author's `emit` instead of an
+  internal label (`aggregate by_category.total: ...`). A decimal total out of
+  range no longer says "integer sum overflow". Each message gives one fix the
+  author can paste, and none converts a float to a decimal: a float Source
+  column is declared `type: decimal`, which the reader parses exactly, and a
+  computed float is matched by converting the decimal side with `.to_float()`.
+  The integer `sum` overflow now prints `sum(amount.to_decimal())`, and a
+  `weighted_avg` whose weights are all zero prints a Transform that drops them,
+  `config: { cxl: "filter qty != 0" }`. A JSON number read into a `decimal`
+  column is still parsed through a float first ([#1299](https://github.com/rustpunk/clinker/issues/1299)).
+- **A Cull rule's failure names the rule.** An accumulator failure in a
+  `drop_group_when` rule says `` a `drop_group_when` rule failed: `` and gives
+  the accumulator's message, instead of naming the engine's label for the
+  rule.
+- **Envelope footers.** An aggregate in an Envelope `footer:` that fails now
+  reports that aggregate error, naming the node and `<section>.<field>`,
+  instead of an internal error. It still stops the run.
+- **For Rust callers of `clinker-record`:** `AccumulatorError` gains
+  `DecimalOutOfRange`, `QuotientOutOfRange`, `ProductOverflow`,
+  `ZeroTotalWeight` and `MixedDecimalFloat`; the new `ExactDecimalSum` holds a
+  decimal total exactly; `SumState` holds its decimals in an `ExactDecimalSum`
+  (`decimal_sum`, `decimal_count` and `decimal_overflow` are gone), and
+  `WeightedAvgState` holds exact decimal sums, a count of rows whose product
+  overflowed and a count of rows mixing a decimal with a float (its decimal
+  totals, `decimal_rows` and `decimal_overflow` are gone, and its integer
+  totals are private).
+
+### Fixed — float sum, avg and weighted_avg are exact and no longer depend on memory or row order
+
+An Aggregate's float `sum`, `avg` and `weighted_avg` now give the exact total
+of the group's values, rounded once to the nearest float (#1289). They used to
+round after every addition, so the answer could change in its last digits with
+the order rows arrived in or with `memory.limit`, and a group whose rows were
+spread over several spill runs could lose integers: when a run held only
+integers and the group's floats were in an earlier run, merging the partial
+states dropped the integers from the total.
+
+- **One answer at every memory limit and arrival order.** The same group gives
+  the same bytes whether the Aggregate holds every group in memory, spills and
+  merges partial sums, streams over sorted input or runs as a time window.
+  Integers mixed with floats are added exactly, so an integer larger than 2^53
+  is no longer rounded before it is added. A NaN in the group makes the total
+  NaN, and `+inf` with `-inf` makes it NaN. Decimal totals follow the same rule
+  and are covered by the same checks.
+- **Results can differ in the last bits from before.** A float group whose
+  values cancel or span many magnitudes, such as `1e16`, `1.0` and `-1e16`
+  (now `1`), gives the exact total where it used to give the left-to-right
+  one. Window functions are unchanged: `$window.sum` and `$window.avg` still add
+  in partition order.
+- **A relaxed correlation-key Aggregate retracts `avg` and `weighted_avg`
+  without holding rows.** They subtract exactly, like `sum`, so only `min` and
+  `max` still make the Aggregate hold each group's raw rows until commit. An
+  Aggregate of `sum`, `count`, `avg`, `weighted_avg`, `collect` and `any` now
+  keeps a small per-row lineage map instead, and a retracted group equals a
+  rerun over the surviving rows.
+- **A fully retracted `sum` gives null, not 0.** When a retraction removes every
+  contribution to a group's `sum`, the group has no value left, as a group with
+  no rows has none, so the `sum` is null where it used to be 0.
+
 ### Changed — Cull and Reshape order each group like a Sink sort
 
 A Cull or Reshape `order_by` now orders the rows of each group by the same
@@ -300,6 +403,28 @@ Output changes where a sort key holds:
   later, as a sort that spilled to disk already did.
 
 Nulls are still placed only by `null_order`.
+
+### Fixed — Aggregate min and max no longer depend on arrival order
+
+Aggregate `min` and `max` now compare values by the rule sorting uses
+([#1283](https://github.com/rustpunk/clinker/issues/1283); see
+[How values are ordered](docs/user/src/nodes/sink.md#how-values-are-ordered)).
+They used to skip a value they could not compare with the current minimum or
+maximum: in a column holding both integers and floats, a value of one type
+that arrived after a value of the other type was ignored, so
+`max` of `5, 3.5, 1, 7.5` could answer `5`. A NaN that arrived first stuck as
+the minimum, and because a group spilled to disk was folded in a different
+order, the answer could change with the memory limit.
+
+- **Numbers** compare by exact value across integer, float and decimal.
+- **NaN** is the largest value.
+- **Equal values** return a fixed representative: `min` prefers an integer,
+  then the decimal with fewer fractional digits, then the float with the
+  smaller sign, and `max` the reverse, so `min(1, 1.0)` is `1`,
+  `max(1, 1.0)` is `1.0` and `min(-0.0, 0.0)` is `-0.0`.
+
+Nulls are still skipped. The answer is now the same for every arrival order
+and every memory limit.
 
 ### Changed — terminal Output nodes are now Sinks
 

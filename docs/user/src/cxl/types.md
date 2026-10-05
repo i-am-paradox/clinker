@@ -268,6 +268,24 @@ the pipeline.
 Comparisons follow the same rule: `decimal < int` is fine, `decimal < float`
 requires a cast.
 
+The branches of a conditional follow it too. An `if`, a `match` or a `??` whose
+branches are a decimal and a float does not compile, because its result would
+be a decimal on some rows and a float on others:
+
+```text
+cannot mix decimal and float without an explicit cast: the branches of this `if` are a decimal (`amount`) and a float (`price`); declare `price` a decimal in its Source schema, `type: decimal` in place of `type: float`, so the branches have one numeric type
+```
+
+The message gives one fix. When the float is a Source column, declare it
+`type: decimal` in its Source schema: the reader parses the column's text
+exactly, so `if flag then amount else price` is a decimal holding the values
+the file holds. (A JSON number read into a `decimal` column is still parsed
+through a float first; see [#1299](https://github.com/rustpunk/clinker/issues/1299).) When the float is computed
+rather than read from a Source column, convert the decimal side instead:
+`if flag then amount.to_float() else price * 2.0` is a float. Converting a
+float with `.to_decimal()` does not make it exact: the decimal keeps the
+float's binary digits.
+
 ### Casting
 
 `x.to_decimal()` converts an int, string, or float into a decimal (`try_decimal`
@@ -295,8 +313,19 @@ JSON output renders a decimal as a scale-preserving string.)
 `sum`, `avg`, `min`, `max`, `count`, and `distinct` all work over a `decimal`
 column and stay exact — no binary float ever touches a running total:
 
-- `sum(amount)` and `avg(amount)` return a `decimal`. The sum is the exact
-  total to the cent; the average is the exact full-precision quotient.
+- `sum(amount)` returns a `decimal`: the exact total of the group's values at
+  the largest scale among them, rounded once (half to even) only when it does
+  not fit a decimal at that scale. The sum of `1.00`,
+  `-1.00` and `2` is `2.00` in any order, and a total of amounts with two
+  decimal places is exact to the cent.
+- `avg(amount)` is `sum(amount) / count(amount)`, a `decimal` at full division
+  precision, and `weighted_avg(v, w)` is `sum(v * w) / sum(w)`: the same
+  digits and scale as those expressions give.
+- Only a group with no non-null value gives null. A decimal total outside the
+  decimal range, a `weighted_avg` whose weights total zero or whose row
+  product is out of range, and a group holding both decimals and floats each
+  fail the group with an `aggregate_finalize` error that names the fix (see
+  [Aggregate functions](aggregates.md#sumexpr---int-float-or-decimal)).
 - `min` / `max` return the exact extremum, and `count` returns an integer.
 - Group-by and `distinct` keys are scale-normalized: two decimals that are
   numerically equal group together regardless of scale, so `2.50` and `2.5`
@@ -313,16 +342,20 @@ required: a full-precision quotient overflows a narrow numeric field, which is a
 hard error, whereas the rounded value fits.
 
 `weighted_avg` also stays exact over decimals: a decimal value or weight (or
-both) gives an exact `sum(value * weight) / sum(weight)` at full division
-precision, and a zero total weight returns null. A decimal in one position
-mixed with a binary `float` in the other is a type error, matching the
-`decimal ⊗ float` arithmetic rule — cast with `.to_decimal()` or `.to_float()`
-so the value and weight share one numeric domain.
+both) gives `sum(value * weight) / sum(weight)` over exact totals, at full
+division precision. A zero total weight is an error, as `x / 0` is. A decimal
+in one position mixed with a binary `float` in the other is a type error,
+matching the `decimal ⊗ float` arithmetic rule. Declare a float Source column
+`type: decimal` so the value and weight share one numeric domain, or, when the
+float is computed, convert the decimal argument with `.to_float()`.
 
 ## Type unification rules
 
 When two types meet in an expression, CXL coerces them automatically:
 
 - Numbers combine: mixing an integer and a float gives a float (`2 + 3.5` is `5.5`).
+- A decimal and a float never combine, in an operator or in the branches of an
+  `if`, `match` or `??`: declare a float Source column `type: decimal`, or
+  convert the decimal side with `.to_float()` when the float is computed.
 - Arithmetic and ordering comparisons with `null` give `null`. `==` and `!=` never do (`null == null` is `true`), and `and`/`or` give a definite answer when the other side settles it. See [Null Handling](nulls.md).
 - Mismatched types are an error: `String + Int` fails. Convert first with `.to_int()` or `.to_string()` so both sides are the same type.
