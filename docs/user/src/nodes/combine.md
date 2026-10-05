@@ -70,7 +70,7 @@ The `where:` expression is a CXL boolean expression evaluated for every candidat
 Compound predicates combine multiple conjuncts with `and`. Each conjunct is classified by the planner:
 
 - **Equi conjunct** -- a cross-input equality (`a.x == b.y`). Drives the hash lookup or sort-merge join.
-- **Range conjunct** -- a cross-input ordered comparison (`a.start <= b.ts and b.ts <= a.end`). Handled by the IEJoin algorithm when no equi conjunct constrains the same input pair.
+- **Range conjunct** -- a cross-input ordered comparison (`a.start <= b.ts and b.ts <= a.end`). Handled by a range join (IEJoin), whether or not an equi conjunct also links the same two inputs.
 - **Residual conjunct** -- any other CXL predicate (intra-input filter, function call, etc.). Applied as a post-filter after the equi/range match.
 
 ```yaml
@@ -224,7 +224,7 @@ Combine accepts any number of inputs. Each pair of inputs that should be related
     propagate_ck: driver
 ```
 
-The planner builds a join tree by walking equalities pairwise and ordering the joins by selectivity.
+The planner builds a join tree by walking equalities pairwise: starting from the driver, it adds one input at a time, always one linked by an equality to the inputs already joined. It is designed to prefer the input with the fewest rows at each step, but those row counts are not available yet when it runs, so in practice it takes the linked inputs in the order they are declared.
 
 ## Choosing the driving input
 
@@ -248,7 +248,7 @@ With `drive: products`, the pipeline emits one row per product enriched with a m
 
 | Value | Behavior |
 |-------|----------|
-| `auto` (default) | Planner picks a strategy from the predicate shape. Hash join for equi predicates; IEJoin for pure-range predicates. |
+| `auto` (default) | Planner picks a strategy from the predicate shape. Equalities only: an in-memory hash join, or grace hash when the build side's estimated size is close to the memory limit. Equalities plus ranges: a range join (IEJoin) that also groups by the equal values. Ranges only: a sort-merge join when there is a single comparison between two `int`, `float`, `date` or `datetime` fields of the same type (not `decimal`) and both inputs already arrive sorted ascending on those fields, each from a single sorted file or stream; otherwise a range join (IEJoin). Both give the same result. |
 | `grace_hash` | Force grace hash join (disk-spilling partitioned hash). Applies only to pure-equi predicates; ignored on predicates with range conjuncts. |
 
 The choice is made when the pipeline is planned, from an estimate of the inputs' size. Under `auto`, an equal-ids join runs in memory unless that estimate says the build side is too large. If the estimate is low or missing (for example, a `glob:` source whose files are not known in advance) and the build side turns out larger than the memory budget, the run stops with `E310 MemoryBudgetExceeded`; it does not switch to disk partway through ([#1337](https://github.com/rustpunk/clinker/issues/1337)). Set `strategy: grace_hash` when the build side may be larger than the memory budget: it partitions the build side to disk from the start.
