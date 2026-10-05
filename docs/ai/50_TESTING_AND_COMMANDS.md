@@ -424,6 +424,7 @@ cargo test -p clinker --test output_containment --locked --offline
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- workflow verify
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- boundary audit --scope rust-only --root .
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem self-test
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- ci change-scope --event pull_request
 ```
 
 Status: **Verified.** The Rust-only audit checks the real repository as well as
@@ -875,6 +876,35 @@ the CLI (`cargo build --locked -p clinker`) and runs each
 (`.github/workflows/ci.yml`, "Smoke-check example pipelines" step). If a change
 touches example pipelines, plan/config validation, or CLI explain behavior,
 run that smoke pass locally before pushing.
+
+A pull request or push that changes only files under `docs/` takes a shorter
+path. The `changes` job runs `ci change-scope` from `tools/release-policy`,
+which reports two flags:
+
+- `docs_only=true` (every path under `docs/`) skips `test-windows`,
+  `test-macos`, `cross-platform`, `deny`, `Build portability`, and the `check`
+  job's rustfmt, clippy, example-smoke, scenario, and bench steps. The Linux
+  `cargo test --workspace` still runs, because Rust code reads `docs/explain/`
+  (compiled into the binary) and `docs/ai/` (the crate map and architecture
+  pages).
+- `book_only=true` (every path under `docs/user/`, `docs/engine/`, or
+  `docs/theme/`, which no Rust code reads) also skips the Rust toolchain and the
+  Linux test suite.
+
+Every docs-only change still runs the AI documentation check (it validates
+links into the books), both policy jobs, and the filesystem matrix, whose
+evidence a release of that exact commit requires. Any other path, including
+root Markdown files and `examples/`, runs the full workflow, as does a manual
+dispatch or any case the classifier cannot establish. The workflow trust gate
+pins the guard expressions and which jobs and steps may skip.
+
+Two lints read book pages and do not run for a book-only change:
+`sink_surface` scans all of `docs/` for retired sink spellings, and
+`mdbook_navigation` checks the book's `SUMMARY.md` and the Sink and Output
+pages. A book change that breaks either, or that only Windows or macOS would
+reject, is caught by the next full run, not its own. Run
+`cargo test -p clinker --test sink_surface --test mdbook_navigation` locally
+before pushing a change to those pages.
 
 Status: **Inferred from CI for the exact online forms.** Locked/offline variants of all Rust compile/test/bench commands above were verified where practical; `cargo deny check` was verified outside the filesystem sandbox.
 
