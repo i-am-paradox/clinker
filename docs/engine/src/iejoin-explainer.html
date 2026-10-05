@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinker engine · Range joins, block by block</title>
+<style>
+:root{
+  --iron:#14110f; --iron2:#1d1915; --iron3:#29231d; --seam:#3a3129;
+  --ash:#b9ab98; --bone:#ece2d0; --dim:#7d705f;
+  --rust:#d0581f; --rust-d:#8f3a13; --brass:#e0a93e; --verd:#4fb0a0;
+  --blood:#e0362c; --steel:#7f97ad; --plum:#b07ac0; --moss:#9bc76b;
+  --disp:"Rajdhani", "Bahnschrift Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --mono:"Share Tech Mono", "Source Code Pro", Consolas, "Ubuntu Mono", monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--iron);color:var(--bone);font:15px/1.6 var(--mono);
+  background-image:
+   radial-gradient(1000px 520px at 85% -10%, rgba(79,176,160,.12), transparent 60%),
+   radial-gradient(800px 480px at -10% 60%, rgba(127,151,173,.08), transparent 60%),
+   repeating-linear-gradient(90deg, rgba(255,255,255,.012) 0 1px, transparent 1px 6px);}
+a{color:var(--verd)}
+code{font-family:var(--mono);background:var(--iron3);padding:0 .35em;border:1px solid var(--seam);color:var(--brass);font-size:.92em;overflow-wrap:anywhere}
+pre{background:var(--iron);border:1px solid var(--seam);padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;color:var(--ash);max-width:100%;margin:10px 0}
+header.hero{padding:64px 6vw 36px;border-bottom:2px solid var(--seam);position:relative;overflow:hidden}
+header.hero::after{content:"";position:absolute;right:-30px;top:-10px;width:330px;height:330px;pointer-events:none;
+  background:
+   linear-gradient(var(--seam),var(--seam)) 0 0/100% 1px,
+   repeating-linear-gradient(90deg,rgba(79,176,160,.14) 0 54px,transparent 54px 66px),
+   repeating-linear-gradient(0deg,rgba(79,176,160,.10) 0 54px,transparent 54px 66px);
+  clip-path:polygon(30% 0,100% 0,100% 100%,0 100%)}
+.ij-kicker{font:700 12px/1.4 var(--mono);letter-spacing:.24em;text-transform:uppercase;color:var(--verd)}
+.ij-kicker a{color:inherit}
+h1{font:700 clamp(44px,8.6vw,112px)/.88 var(--disp);margin:14px 0 18px;text-transform:uppercase;letter-spacing:-.01em}
+h1 em{font-style:normal;color:var(--verd)}
+.ij-lede{max-width:800px;color:var(--ash);font-size:16px}
+nav.ij-toc{display:flex;flex-wrap:wrap;margin-top:26px;border:1px solid var(--seam);width:fit-content;max-width:100%}
+nav.ij-toc a{padding:10px 14px;text-decoration:none;color:var(--ash);border-right:1px solid var(--seam);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+nav.ij-toc a:last-child{border-right:0}
+nav.ij-toc b{color:var(--verd);margin-right:6px}
+@media (hover:hover){nav.ij-toc a:hover{background:var(--verd);color:var(--iron)}}
+section{padding:52px 6vw;border-bottom:1px solid var(--seam)}
+section:nth-of-type(even){background:rgba(0,0,0,.18)}
+.ij-sechead{display:grid;grid-template-columns:110px 1fr;gap:22px;align-items:end;margin-bottom:22px}
+.ij-num{font:700 110px/.8 var(--disp);color:transparent;-webkit-text-stroke:2px #2d6b61}
+h2{font:700 clamp(30px,4.4vw,56px)/.95 var(--disp);text-transform:uppercase;margin:0}
+h2 small{display:block;font:400 14px/1.4 var(--mono);text-transform:none;color:var(--dim);margin-top:10px}
+h3{font:700 20px/1.1 var(--disp);text-transform:uppercase;letter-spacing:.04em;color:var(--verd);margin:0 0 10px}
+p{max-width:840px}
+.ij-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr);gap:28px}
+.ij-cols>*{min-width:0}
+.ij-panel{background:var(--iron2);border:1px solid var(--seam);padding:18px;min-width:0}
+.ij-aside{font-size:13px;color:var(--ash)}
+.ij-callout{border-left:4px solid var(--verd);background:rgba(79,176,160,.07);padding:12px 16px;margin:16px 0;max-width:840px}
+.ij-callout--warn{border-color:var(--brass);background:rgba(224,169,62,.07)}
+
+/* controls */
+.ij-controls{position:sticky;top:0;z-index:5;background:rgba(20,17,15,.96);border-bottom:2px solid var(--seam);padding:12px 6vw;backdrop-filter:blur(4px)}
+.ij-ctlgrid{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center}
+.ij-ctl{display:grid;grid-template-columns:auto auto;gap:6px 8px;align-items:center}
+.ij-ctlhead{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.ij-seg{display:inline-flex;border:2px solid var(--seam);flex-wrap:wrap}
+.ij-seg button{font:700 12px/1 var(--mono);letter-spacing:.03em;padding:8px 9px;border:0;border-right:1px solid var(--seam);background:transparent;color:var(--ash);cursor:pointer}
+.ij-seg button:last-child{border-right:0}
+.ij-seg button[aria-pressed=true]{background:var(--verd);color:var(--iron)}
+.ij-ctl-toggle{font-size:12px}
+
+/* 01 plan */
+table.ij-t{border-collapse:collapse;font-size:13px;width:100%}
+table.ij-t th,table.ij-t td{border:1px solid var(--seam);padding:6px 8px;text-align:left;vertical-align:top}
+table.ij-t th{font:700 12px/1.2 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--verd);background:var(--iron)}
+.ij-wrap{overflow-x:auto;max-width:100%}
+.ij-pick{display:inline-block;font:700 13px/1 var(--mono);padding:6px 9px;border:2px solid var(--verd);color:var(--verd);margin:4px 0}
+.ij-ok{color:var(--moss)} .ij-no{color:var(--dim)}
+
+/* 02 blocks */
+.ij-side{margin:8px 0 14px}
+.ij-side h4{margin:0 0 6px;font:700 15px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;color:var(--bone)}
+.ij-blocks{display:flex;flex-wrap:wrap;gap:8px}
+.ij-block{border:2px solid var(--steel);background:var(--iron);padding:6px 8px;min-width:0;font-size:12px}
+.ij-block b{display:block;font:700 13px/1 var(--disp);letter-spacing:.06em;color:var(--steel);margin-bottom:4px}
+.ij-block .ij-meta{color:var(--dim);font-size:11px}
+.ij-rowchip{display:inline-block;margin:2px 4px 2px 0;padding:1px 5px;border:1px solid var(--seam);background:var(--iron3);white-space:nowrap}
+.ij-pile{border:2px dashed var(--brass);padding:6px 8px;font-size:12px;color:var(--brass);margin-top:6px}
+
+/* 03 pairs grid */
+.ij-grid{display:grid;gap:4px;margin-top:8px}
+.ij-cell{font:12px/1.25 var(--mono);border:2px solid var(--seam);background:var(--iron);color:var(--ash);padding:8px 6px;cursor:pointer;text-align:center;min-height:44px}
+.ij-cell.ij-kept{border-color:var(--verd);color:var(--bone)}
+.ij-cell.ij-nl{border-color:var(--brass);color:var(--brass)}
+.ij-cell.ij-pruned{border-style:dashed;color:var(--dim)}
+.ij-cell.ij-never{border-color:transparent;background:repeating-linear-gradient(45deg,var(--iron2) 0 6px,var(--iron) 6px 12px);cursor:default;color:var(--dim)}
+.ij-cell[aria-pressed=true]{outline:3px solid var(--brass);outline-offset:1px}
+.ij-head{font:700 11px/1.2 var(--mono);color:var(--steel);display:flex;align-items:center;justify-content:center;text-align:center;padding:2px}
+.ij-why{margin-top:10px;font-size:13px;color:var(--ash);border:1px solid var(--seam);background:var(--iron);padding:10px 12px}
+
+/* 04 kernel */
+.ij-arr{display:flex;flex-wrap:wrap;gap:3px;margin:4px 0 10px}
+.ij-arr span{display:inline-grid;place-items:center;min-width:52px;padding:4px 5px;border:1px solid var(--seam);background:var(--iron);font-size:12px;line-height:1.2;text-align:center}
+.ij-arr span small{display:block;color:var(--dim);font-size:10px}
+.ij-arr .ij-L{border-color:var(--verd)} .ij-arr .ij-R{border-color:var(--plum)}
+.ij-arr .ij-cur{outline:3px solid var(--brass)}
+.ij-arr .ij-set{background:rgba(176,122,192,.22)}
+.ij-arr .ij-scan{box-shadow:inset 0 -3px 0 var(--brass)}
+.ij-steprow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+.ij-btn{font:700 12px/1 var(--mono);padding:10px 12px;border:2px solid var(--seam);background:var(--iron);color:var(--bone);cursor:pointer;min-height:44px}
+.ij-btn:disabled{opacity:.4;cursor:default}
+.ij-narr{font-size:13px;color:var(--bone);border-left:3px solid var(--brass);padding:6px 10px;background:rgba(224,169,62,.06)}
+.ij-legend{font-size:12px;color:var(--dim)}
+
+/* 05 output */
+.ij-badge{display:inline-block;font:700 11px/1 var(--mono);padding:4px 6px;border:1px solid;letter-spacing:.05em;text-transform:uppercase}
+.ij-badge--ok{color:var(--moss);border-color:var(--moss)}
+.ij-badge--bad{color:var(--blood);border-color:var(--blood)}
+.ij-err{border:2px solid var(--blood);padding:10px 12px;color:var(--bone);font-size:13px}
+footer{padding:36px 6vw;color:var(--dim);font-size:12px}
+
+@media (max-width:980px){.ij-cols{grid-template-columns:1fr}}
+@media (max-width:720px){
+  .ij-sechead{grid-template-columns:1fr;gap:6px}.ij-num{font-size:64px}
+  h2{font-size:clamp(26px,9vw,34px)}
+  section{padding:40px 5vw}
+  header.hero{padding:44px 5vw 28px}
+  .ij-controls{position:static;padding:12px 5vw}
+}
+@media (max-width:720px),(pointer:coarse){
+  .ij-aside,footer,.ij-why,.ij-narr,table.ij-t,.ij-block,.ij-pile{font-size:14px}
+}
+@media (max-width:560px){
+  table.ij-stack tr:first-child{display:none}
+  table.ij-stack td{display:block;border-top:0}
+  table.ij-stack tr td:first-child{border-top:1px solid var(--seam);color:var(--verd)}
+  .ij-cell{font-size:11px;padding:6px 3px}
+  .ij-ctlgrid{display:grid;grid-template-columns:1fr}
+  .ij-ctl{grid-template-columns:1fr}
+  .ij-ctl .ij-seg{display:flex}
+  .ij-ctl .ij-seg button{flex:1 1 auto}
+}
+@media (pointer:coarse),(max-width:720px){
+  .ij-seg button,.ij-btn,.ij-cell{min-height:44px}
+  nav.ij-toc a{display:flex;align-items:center;min-height:44px}
+  .ij-kicker a{display:inline-block;line-height:44px}
+}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="ij-kicker">Clinker engine internals · <a href="combine-internals.html#block-band-iejoin-bounded-on-both-input-axes-and-the-output">← Combine Internals</a></div>
+  <h1>Range joins,<br><em>block by block</em></h1>
+  <p class="ij-lede">A Combine whose <code>where:</code> compares ranges (<code>a.t &gt;= b.lo and a.t &lt; b.hi</code>, with or without an equality) runs on the block-band IEJoin path. Both sides are sorted and cut into blocks tagged with their key ranges; block pairs that cannot match are skipped; each surviving pair runs the IEJoin kernel, or a bounded nested loop when its matches would not fit; and the matches go through <code>match:</code> and <code>on_miss:</code> into one sorted output. This page runs that algorithm on small inputs, step by step, and checks every result against a brute-force join.</p>
+  <nav class="ij-toc">
+    <a href="#plan"><b>01</b>Plan</a>
+    <a href="#blocks"><b>02</b>Sort &amp; slice</a>
+    <a href="#pairs"><b>03</b>Block pairs</a>
+    <a href="#kernel"><b>04</b>Kernel</a>
+    <a href="#output"><b>05</b>Output</a>
+  </nav>
+</header>
+
+<div class="ij-controls" data-ij-controls>
+  <div class="ij-ctlgrid">
+    <div class="ij-ctl"><span class="ij-ctlhead">Example</span><div class="ij-seg" data-ij-bind="preset"><button data-v="bands">bands (range only)</button><button data-v="sessions">sessions (equality + range)</button></div></div>
+    <div class="ij-ctl"><span class="ij-ctlhead">Rows per block</span><div class="ij-seg" data-ij-bind="rpb"><button data-v="0">default</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="3">3</button></div></div>
+    <div class="ij-ctl"><span class="ij-ctlhead">Pair budget</span><div class="ij-seg" data-ij-bind="cap"><button data-v="0">default</button><button data-v="3">3 pairs</button><button data-v="1">1 pair</button></div></div>
+    <div class="ij-ctl"><span class="ij-ctlhead">match</span><div class="ij-seg" data-ij-bind="mode"><button data-v="all">all</button><button data-v="first">first</button><button data-v="collect">collect</button></div></div>
+    <div class="ij-ctl"><span class="ij-ctlhead">on_miss</span><div class="ij-seg" data-ij-bind="miss"><button data-v="null_fields">null_fields</button><button data-v="skip">skip</button><button data-v="error">error</button></div></div>
+    <div class="ij-ctl" data-ij-opsctl><span class="ij-ctlhead">Operators</span><div class="ij-seg" data-ij-bind="ops"><button data-v="ge_lt">&gt;= … &lt;</button><button data-v="gt_le">&gt; … &lt;=</button><button data-v="ge_le">&gt;= … &lt;=</button></div></div>
+    <div class="ij-ctl"><span class="ij-ctlhead">Driver with a null key</span><div class="ij-seg" data-ij-bind="nullrow"><button data-v="0">no</button><button data-v="1">yes</button></div></div>
+  </div>
+</div>
+
+<!-- ============================ 01 ============================ -->
+<section id="plan">
+  <div class="ij-sechead"><div class="ij-num">01</div><h2>Plan<small>Which strategy the planner picks, and what the kernel checks</small></h2></div>
+  <div class="ij-cols">
+    <div class="ij-panel"><h3>The Combine</h3><pre data-ij-yaml></pre></div>
+    <div class="ij-panel">
+      <h3>Conjuncts</h3>
+      <div class="ij-wrap"><table class="ij-t ij-stack" data-ij-conj></table></div>
+      <p class="ij-aside" data-ij-flipnote></p>
+      <div data-ij-strategy></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 02 ============================ -->
+<section id="blocks">
+  <div class="ij-sechead"><div class="ij-num">02</div><h2>Sort &amp; slice<small>Each side sorted by (equality hash, k1, k2, input index), then cut into blocks</small></h2></div>
+  <div data-ij-sides></div>
+  <p class="ij-aside" data-ij-slicenote></p>
+</section>
+
+<!-- ============================ 03 ============================ -->
+<section id="pairs">
+  <div class="ij-sechead"><div class="ij-num">03</div><h2>Block pairs<small>Rows are driver blocks, columns build blocks. Tap a pair.</small></h2></div>
+  <div class="ij-cols">
+    <div class="ij-panel">
+      <div class="ij-wrap"><div class="ij-grid" data-ij-grid></div></div>
+      <p class="ij-legend">Solid green: kept, kernel ran · solid yellow: kept, too many matches for the pair budget, so the bounded nested loop ran · dashed: pruned by the min/max test · striped: different equality hash, never paired.</p>
+    </div>
+    <div class="ij-panel"><h3>Why</h3><div class="ij-why" data-ij-why></div></div>
+  </div>
+</section>
+
+<!-- ============================ 04 ============================ -->
+<section id="kernel">
+  <div class="ij-sechead"><div class="ij-num">04</div><h2>Kernel<small>IEJoin on the selected block pair: two sorted lists, a permutation, a bit array</small></h2></div>
+  <div data-ij-kernel></div>
+</section>
+
+<!-- ============================ 05 ============================ -->
+<section id="output">
+  <div class="ij-sechead"><div class="ij-num">05</div><h2>Output<small>match:, on_miss:, and one sort by (driver index, build index)</small></h2></div>
+  <div class="ij-cols">
+    <div class="ij-panel"><h3>Rows out</h3><div data-ij-out></div></div>
+    <div class="ij-panel"><h3>Checks</h3><div data-ij-checks></div></div>
+  </div>
+</section>
+
+<footer>Algorithm: <code>crates/clinker-exec/src/pipeline/iejoin.rs</code> (kernel, <code>iejoin_numeric_capped</code>; emit, <code>emit_pairs</code>) and <code>iejoin/block.rs</code> (slicing, <code>possible</code>, the block-pair scheduler and the nested-loop fallback); planning in <code>crates/clinker-plan/src/plan/combine.rs</code>. The two examples are the engine's own fixtures: <code>iejoin_temporal_overlap</code> and a band join checked against the nested-loop oracle. Clinker engine internals.</footer>
+
+<script>
+(() => {
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ---------- data ---------- */
+const PRESETS = {
+  bands: {
+    drvQ: "events", bldQ: "bands",
+    drvCols: ["id", "t"], bldCols: ["id", "lo", "hi"],
+    drivers: [["d0",12],["d1",47],["d2",5],["d3",33],["d4",60],["d5",21]],
+    nullDriver: ["dn", null],
+    builds: [["b0",30,40],["b1",0,10],["b2",50,70],["b3",10,25],["b4",40,50],["b5",20,35]],
+    eq: null,
+    conj: [ { d: "t", b: "lo" }, { d: "t", b: "hi" } ]
+  },
+  sessions: {
+    drvQ: "events", bldQ: "sessions",
+    drvCols: ["event_id", "group_id", "start", "end"], bldCols: ["session_id", "group_id", "start_ts", "end_ts"],
+    drivers: [["evt-001","grp-1",10,20],["evt-002","grp-1",15,25],["evt-003","grp-1",40,50],["evt-004","grp-2",5,12],["evt-005","grp-2",30,35]],
+    nullDriver: ["evt-0n","grp-1",null,30],
+    builds: [["sess-A","grp-1",8,18],["sess-B","grp-1",22,28],["sess-C","grp-1",45,55],["sess-D","grp-2",1,10],["sess-E","grp-2",28,38]],
+    eq: { d: "group_id", b: "group_id" },
+    conj: [ { d: "start", b: "end_ts", op: "<=" }, { d: "end", b: "start_ts", op: ">=" } ]
+  }
+};
+const OPS = { ge_lt: [">=", "<"], gt_le: [">", "<="], ge_le: [">=", "<="] };
+
+const S = { preset: "bands", rpb: "0", cap: "0", mode: "all", miss: "null_fields", ops: "ge_lt", nullrow: "0", pair: null, step: 0 };
+
+/* ---------- the engine's rules ---------- */
+const strict = op => op === "<" || op === ">";
+const dirAsc = op => op === "<" || op === "<=";            // primary_dir
+const apply = (op, a, b) => op === "<" ? a < b : op === "<=" ? a <= b : op === ">" ? a > b : a >= b;
+const cmpDir = (a, b, asc) => asc ? (a < b ? -1 : a > b ? 1 : 0) : (a > b ? -1 : a < b ? 1 : 0);
+
+/* block.rs `possible`: can any driver in [dmin,dmax] meet any build in [bmin,bmax]? */
+function possible(op, dmin, dmax, bmin, bmax) {
+  return op === "<" ? dmin < bmax : op === "<=" ? dmin <= bmax : op === ">" ? dmax > bmin : dmax >= bmin;
+}
+
+/* iejoin.rs `iejoin_numeric_capped`, with a trace */
+function kernel(L, R, op1, op2) {
+  const ent = [];
+  L.forEach((k, i) => ent.push({ s: i + 1, k1: k[0], k2: k[1] }));
+  R.forEach((k, j) => ent.push({ s: -(j + 1), k1: k[0], k2: k[1] }));
+  const l1IdxAsc = strict(op1);          // strict: right (negative) first
+  const l2IdxAsc = !strict(op2);         // strict: left first (desc)
+  const l1 = ent.slice().sort((a, b) => cmpDir(a.k1, b.k1, dirAsc(op1)) || cmpDir(a.s, b.s, l1IdxAsc));
+  const l2 = ent.slice().sort((a, b) => cmpDir(a.k2, b.k2, !dirAsc(op2)) || cmpDir(a.s, b.s, l2IdxAsc));
+  const l1pos = new Map(l1.map((e, p) => [e.s, p]));
+  const P = l2.map(e => l1pos.get(e.s));
+  const eqOff = (!strict(op1) && !strict(op2)) ? 0 : 1;
+  const bits = new Array(ent.length).fill(false);
+  const out = [], trace = [];
+  l2.forEach((e, pos) => {
+    if (e.s > 0) {
+      const start = P[pos] + eqOff, found = [];
+      for (let q = start; q < bits.length; q++) if (bits[q]) { found.push(q); out.push([e.s - 1, -l1[q].s - 1]); }
+      trace.push({ pos, side: "L", s: e.s, start, found, bits: bits.slice() });
+    } else {
+      bits[P[pos]] = true;
+      trace.push({ pos, side: "R", s: e.s, set: P[pos], bits: bits.slice() });
+    }
+  });
+  return { l1, l2, P, eqOff, out, trace };
+}
+
+function simulate() {
+  const pr = PRESETS[S.preset];
+  const [op1b, op2b] = S.preset === "bands" ? OPS[S.ops] : [pr.conj[0].op, pr.conj[1].op];
+  const op1 = op1b, op2 = S.preset === "bands" ? op2b : pr.conj[1].op;
+  const col = (cols, name) => cols.indexOf(name);
+  const drvRows = pr.drivers.slice(); if (S.nullrow === "1") drvRows.push(pr.nullDriver);
+  const mk = (rows, cols, which) => rows.map((r, idx) => {
+    const k1 = r[col(cols, pr.conj[0][which])], k2 = r[col(cols, pr.conj[1][which])];
+    const h = pr.eq ? r[col(cols, pr.eq[which])] : "";
+    return { idx, id: r[0], h, k1, k2, raw: r };
+  });
+  const D = mk(drvRows, pr.drvCols, "d"), B = mk(pr.builds, pr.bldCols, "b");
+  const scanPile = D.filter(r => r.k1 === null || r.k2 === null || r.h === null);
+  const Dk = D.filter(r => !scanPile.includes(r)), Bk = B.filter(r => r.k1 !== null && r.k2 !== null);
+  const sortKey = (a, b) => (a.h < b.h ? -1 : a.h > b.h ? 1 : 0) || a.k1 - b.k1 || a.k2 - b.k2 || a.idx - b.idx;
+  Dk.sort(sortKey); Bk.sort(sortKey);
+  const rpb = +S.rpb;
+  const slice = (rows, tag) => {
+    const blocks = []; let cur = null;
+    for (const r of rows) {
+      if (cur && cur.rows.length && r.h !== cur.h) { blocks.push(cur); cur = null; }
+      if (!cur) cur = { h: r.h, rows: [] };
+      cur.rows.push(r);
+      if (rpb && cur.rows.length >= rpb) { blocks.push(cur); cur = null; }
+    }
+    if (cur) blocks.push(cur);
+    blocks.forEach((b, i) => {
+      b.name = tag + i;
+      b.k1min = Math.min(...b.rows.map(r => r.k1)); b.k1max = Math.max(...b.rows.map(r => r.k1));
+      b.k2min = Math.min(...b.rows.map(r => r.k2)); b.k2max = Math.max(...b.rows.map(r => r.k2));
+    });
+    return blocks;
+  };
+  const DB = slice(Dk, "D"), BB = slice(Bk, "B");
+  const cap = +S.cap || Infinity;
+  const pairs = [];
+  const cand = new Map(D.map(r => [r.idx, []]));
+  for (const d of DB) for (const b of BB) {
+    const p = { d, b };
+    if (d.h !== b.h) { p.kind = "never"; pairs.push(p); continue; }
+    const a1 = possible(op1, d.k1min, d.k1max, b.k1min, b.k1max);
+    const a2 = possible(op2, d.k2min, d.k2max, b.k2min, b.k2max);
+    if (!a1 || !a2) { p.kind = "pruned"; p.failed = !a1 ? 1 : 2; pairs.push(p); continue; }
+    p.k = kernel(d.rows.map(r => [r.k1, r.k2]), b.rows.map(r => [r.k1, r.k2]), op1, op2);
+    p.matches = p.k.out.map(([li, ri]) => [d.rows[li], b.rows[ri]]);
+    p.kind = p.matches.length > cap ? "nl" : "kept";
+    for (const [dr, br] of p.matches) cand.get(dr.idx).push(br.idx);
+    pairs.push(p);
+  }
+  /* brute-force oracle, as combine_iejoin_prop.rs does */
+  const oracle = [];
+  for (const d of D) for (const b of B) {
+    if (d.k1 === null || d.k2 === null || b.k1 === null || b.k2 === null) continue;
+    if (pr.eq && d.h !== b.h) continue;
+    if (apply(op1, d.k1, b.k1) && apply(op2, d.k2, b.k2)) oracle.push(d.idx + ":" + b.idx);
+  }
+  const got = [...cand].flatMap(([di, bs]) => bs.map(bi => di + ":" + bi));
+  const same = got.length === oracle.length && [...got].sort().join() === [...oracle].sort().join();
+  /* match / on_miss / output sort */
+  const out = []; let error = null;
+  const missOf = r => {
+    if (S.mode === "collect") { out.push({ d: r.idx, b: Infinity, row: [r.id, "[]"] }); return; }
+    if (S.miss === "skip") return;
+    if (S.miss === "error") { if (!error || r.idx < error.idx) error = r; return; }
+    out.push({ d: r.idx, b: Infinity, row: [r.id, "null"] });
+  };
+  for (const r of D) {
+    const bs = cand.get(r.idx).slice().sort((a, b) => a - b);
+    if (scanPile.includes(r) || bs.length === 0) { missOf(r); continue; }
+    if (S.mode === "first") out.push({ d: r.idx, b: bs[0], row: [r.id, B[bs[0]].id] });
+    else if (S.mode === "all") bs.forEach(bi => out.push({ d: r.idx, b: bi, row: [r.id, B[bi].id] }));
+    else out.push({ d: r.idx, b: Infinity, row: [r.id, "[" + bs.map(bi => B[bi].id).join(", ") + "]"] });
+  }
+  out.sort((x, y) => x.d - y.d || x.b - y.b);
+  return { pr, op1, op2, D, B, DB, BB, scanPile, pairs, oracle, got, same, out, error, cap };
+}
+
+/* ---------- render ---------- */
+const nameOf = (pr, which, f) => (which === "d" ? pr.drvQ : pr.bldQ) + "." + f;
+
+function render() {
+  const R = simulate(), pr = R.pr;
+  document.querySelectorAll("[data-ij-bind]").forEach(g => g.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(S[g.dataset.ijBind] === b.dataset.v))));
+  $("[data-ij-opsctl]").hidden = S.preset !== "bands";
+
+  /* 01 */
+  const conjText = pr.conj.map((c, i) => `${nameOf(pr, "d", c.d)} ${i === 0 ? R.op1 : R.op2} ${nameOf(pr, "b", c.b)}`);
+  const where = (pr.eq ? [`${nameOf(pr, "d", pr.eq.d)} == ${nameOf(pr, "b", pr.eq.b)}`] : []).concat(conjText).join(" and ");
+  $("[data-ij-yaml]").textContent =
+`- type: combine
+  name: ${S.preset === "bands" ? "banded" : "overlapping"}
+  input:
+    ${pr.drvQ}: ${pr.drvQ}      # declared first: the driver
+    ${pr.bldQ}: ${pr.bldQ}
+  config:
+    where: "${where}"
+    match: ${S.mode}
+    on_miss: ${S.miss}
+    cxl: |
+      emit ...`;
+  const rows = [];
+  if (pr.eq) rows.push(["equality", `${nameOf(pr, "d", pr.eq.d)} == ${nameOf(pr, "b", pr.eq.b)}`, "Hashed into the sort key, so blocks never mix hash values; candidate pairs are re-checked on the key bytes."]);
+  conjText.forEach((t, i) => rows.push([`range ${i ? "op2" : "op1"}`, t, `Kernel axis k${i + 1}.`]));
+  $("[data-ij-conj]").innerHTML = `<tr><th>Conjunct</th><th>Expression</th><th>Handled by</th></tr>` + rows.map(r => `<tr><td>${esc(r[0])}</td><td><code>${esc(r[1])}</code></td><td>${esc(r[2])}</td></tr>`).join("");
+  $("[data-ij-flipnote]").textContent = "Every range conjunct is normalized to read driver OP build: written with the build side on the left, the executor swaps the operands and flips the operator before keying the kernel (< with >, <= with >=). These are written driver-first, so nothing flips. The first range is op1 (key k1), the second op2 (key k2).";
+  $("[data-ij-strategy]").innerHTML = pr.eq
+    ? `<p><span class="ij-pick">HashPartitionIEJoin</span></p><p class="ij-aside">An equality plus at least one range goes here. It runs the same block-band executor as pure-range IEJoin; the equality adds a hash axis to the sort and to block pairing. Two range conjuncts are checked by the kernel itself, so no residual runs.</p><p class="ij-aside">With an equality and only one range conjunct (the as-of shape) the per-pair kernel is a plain enumeration that tests every driver × build row of the pair, not the two-list IEJoin shown in 04 (<a href="https://github.com/rustpunk/clinker/issues/1363">#1363</a>).</p>`
+    : `<p><span class="ij-pick">IEJoin</span></p><p class="ij-aside">No equality and two range conjuncts. SortMerge would need exactly one range conjunct on presorted inputs; a hash join needs an equality. The planner also warns W305 for every pure-range Combine. Two ranges are checked by the kernel, so no residual runs; a third range, a non-range conjunct, or a <code>?? false</code> wrapper would add one.</p><p class="ij-aside">With only one range conjunct the per-pair kernel is a plain enumeration that tests every driver × build row of the pair, not the two-list IEJoin shown in 04 (<a href="https://github.com/rustpunk/clinker/issues/1363">#1363</a>).</p>`;
+
+  /* 02 */
+  const rowLabel = r => pr.eq ? `${r.id} (${r.k1}, ${r.k2})` : (S.preset === "bands" && r.raw.length === 3 ? `${r.id} [${r.k1}, ${r.k2})` : `${r.id} ${r.k1}`);
+  const side = (title, blocks, note) => `<div class="ij-side"><h4>${esc(title)}</h4><div class="ij-blocks">${blocks.map(b =>
+    `<div class="ij-block" data-ij-block="${b.name}"><b>${b.name}${pr.eq ? " · " + esc(b.h) : ""}</b>${b.rows.map(r => `<span class="ij-rowchip">${esc(rowLabel(r))}</span>`).join("")}<div class="ij-meta">k1 ${b.k1min}…${b.k1max} · k2 ${b.k2min}…${b.k2max}</div></div>`).join("")}</div>${note || ""}</div>`;
+  const pile = R.scanPile.length ? `<div class="ij-pile">Unmatched before sorting (null key): ${R.scanPile.map(r => esc(r.id)).join(", ")}. ${S.mode === "collect" || S.miss !== "skip" ? "Held in the scan-phase pile for on_miss / collect." : "Dropped: on_miss is skip and match is not collect."}</div>` : "";
+  $("[data-ij-sides]").innerHTML = side(`Driver: ${pr.drvQ} (k1 = ${pr.conj[0].d}, k2 = ${pr.conj[1].d})`, R.DB, pile) + side(`Build: ${pr.bldQ} (k1 = ${pr.conj[0].b}, k2 = ${pr.conj[1].b})`, R.BB);
+  $("[data-ij-slicenote]").innerHTML = S.rpb === "0"
+    ? `With the default settings a block closes at max(16 KiB, soft limit / 8), about 51 MiB at the default 512 MiB memory limit, or when the equality hash changes. Inputs this small therefore form one block per side${pr.eq ? " per hash value" : ""}. Pick a rows-per-block value to see slicing; the engine's tests do the same with a tiny byte target.${pr.eq ? " Hash groups appear here in name order; the engine orders them by a fixed-seed hash of the key bytes, which changes only the order pairs are visited, not the result." : ""}`
+    : `Here a block closes every ${S.rpb} row${S.rpb === "1" ? "" : "s"} instead of at the byte target, or when the equality hash changes. Each block carries its hash and the min and max of both keys; those tags drive the pruning in 03.${pr.eq ? " Hash groups appear here in name order; the engine orders them by a fixed-seed hash of the key bytes, which changes only the order pairs are visited, not the result." : ""}`;
+
+  /* 03 */
+  const cols = R.BB.length;
+  const grid = $("[data-ij-grid]");
+  grid.style.gridTemplateColumns = `44px repeat(${cols}, minmax(50px, 1fr))`;
+  if (!S.pair || !R.pairs.find(p => p.d.name + "×" + p.b.name === S.pair && p.kind !== "never")) {
+    const first = R.pairs.find(p => p.kind === "kept" || p.kind === "nl") || R.pairs.find(p => p.kind === "pruned");
+    S.pair = first ? first.d.name + "×" + first.b.name : null;
+  }
+  let gh = `<div></div>` + R.BB.map(b => `<div class="ij-head">${b.name}${pr.eq ? "<br>" + esc(b.h) : ""}</div>`).join("");
+  for (const d of R.DB) {
+    gh += `<div class="ij-head">${d.name}${pr.eq ? "<br>" + esc(d.h) : ""}</div>`;
+    for (const b of R.BB) {
+      const p = R.pairs.find(x => x.d === d && x.b === b), key = d.name + "×" + b.name;
+      const label = p.kind === "never" ? "—" : p.kind === "pruned" ? `pruned<br>k${p.failed}` : `${p.matches.length} match${p.matches.length === 1 ? "" : "es"}${p.kind === "nl" ? "<br>nested loop" : ""}`;
+      gh += `<button class="ij-cell ij-${p.kind}" data-ij-pair="${key}" aria-pressed="${key === S.pair}" ${p.kind === "never" ? "disabled" : ""}>${label}</button>`;
+    }
+  }
+  grid.innerHTML = gh;
+  grid.querySelectorAll("button.ij-cell:not([disabled])").forEach(b => b.addEventListener("click", () => { S.pair = b.dataset.ijPair; S.step = 0; render(); }));
+  const sel = R.pairs.find(p => p.d.name + "×" + p.b.name === S.pair);
+  $("[data-ij-why]").innerHTML = whyText(R, sel, grid);
+
+  /* 04 */
+  $("[data-ij-kernel]").innerHTML = kernelView(R, sel);
+  const kp = $("[data-ij-kernel]");
+  kp.querySelectorAll("[data-ij-step]").forEach(b => b.addEventListener("click", () => {
+    const n = sel.k.trace.length;
+    S.step = b.dataset.ijStep === "next" ? Math.min(n, S.step + 1) : b.dataset.ijStep === "prev" ? Math.max(0, S.step - 1) : b.dataset.ijStep === "all" ? n : 0;
+    render();
+  }));
+
+  /* 05 */
+  $("[data-ij-out]").innerHTML = R.error
+    ? `<div class="ij-err">The run stops with <b>E319</b>: on_miss is error and driver row ${esc(R.error.id)} matched no build row. (The engine reports the lowest-index miss.)</div>`
+    : `<div class="ij-wrap"><table class="ij-t" data-ij-outtable><tr><th>${esc(pr.drvQ)}</th><th>${esc(pr.bldQ)}</th></tr>${R.out.map(o => `<tr><td>${esc(o.row[0])}</td><td>${esc(o.row[1])}</td></tr>`).join("")}</table></div><p class="ij-aside">${outNote()}</p>`;
+  const nlPairs = R.pairs.filter(p => p.kind === "nl").length;
+  $("[data-ij-checks]").innerHTML =
+    `<p><span class="ij-badge ${R.same ? "ij-badge--ok" : "ij-badge--bad"}" data-ij-oracle="${R.same}">${R.same ? "matches the brute-force join" : "differs from the brute-force join"}</span></p>
+     <p class="ij-aside">Every driver × build pair was also tested directly (the nested-loop oracle the engine's property tests use): ${R.oracle.length} matching pair${R.oracle.length === 1 ? "" : "s"}, the same set the blocks and the kernel found.</p>
+     <p class="ij-aside">${R.pairs.filter(p => p.kind === "pruned").length} block pair(s) pruned, ${R.pairs.filter(p => p.kind === "never").length} never paired, ${R.pairs.filter(p => p.kind === "kept").length} run by the kernel, ${nlPairs} by the nested loop.</p>
+     <p class="ij-aside">Pair budget: the kernel is asked for at most <code>max_pairs = (hard limit − reserved) / 48</code> pairs (three times 16 bytes, for the vector's growth). If a pair's actual matches would exceed it, the kernel stops early and the pair is re-run as a bounded nested loop that buffers at most min(headroom / 16, 4096) pairs at a time. The decision uses the actual match count, not the block cross product; the output is identical either way. ${S.cap === "0" ? "At the default budget no pair here comes close." : `Here the budget is ${S.cap} pair${S.cap === "1" ? "" : "s"} per block pair.`}</p>`;
+}
+
+function whyText(R, sel, grid) {
+  if (!sel) return "No block pair survived.";
+  const d = sel.d, b = sel.b, pr = R.pr;
+  const ax = (k, op) => {
+    const dmin = d["k" + k + "min"], dmax = d["k" + k + "max"], bmin = b["k" + k + "min"], bmax = b["k" + k + "max"];
+    const test = op === "<" || op === "<=" ? `driver min ${dmin} ${op} build max ${bmax}` : `driver max ${dmax} ${op} build min ${bmin}`;
+    return `<li>k${k} (${esc(op)}): ${test} → ${possible(op, dmin, dmax, bmin, bmax) ? "possible" : "impossible"}</li>`;
+  };
+  let h = `<b>${d.name} × ${b.name}</b>${pr.eq ? ` (hash ${esc(d.h)})` : ""}<ul>${ax(1, R.op1)}${ax(2, R.op2)}</ul>`;
+  h += sel.kind === "pruned"
+    ? `<p>Axis k${sel.failed} is impossible, so no row of ${d.name} can match any row of ${b.name}. The pair is skipped without loading either block or running the kernel.</p>`
+    : sel.kind === "nl"
+    ? `<p>Both tests pass, so the pair runs. The kernel found more than ${R.cap} matches, the pair budget, so it stopped and the pair ran through the bounded nested loop instead: ${sel.matches.length} matches, the same ones.</p>`
+    : `<p>Both tests pass, so the pair runs: ${sel.matches.length} match${sel.matches.length === 1 ? "" : "es"}. Each test asks whether any driver in the block could meet any build row in the block, using only the min and max tags; a pair is skipped as soon as one axis cannot. Tap a dashed cell to see one fail.</p>`;
+  const pruned = R.pairs.filter(p => p.kind === "pruned");
+  if (pruned.length) h += `<p class="ij-aside">Pruned here: ${pruned.map(p => `${p.d.name}×${p.b.name} (k${p.failed})`).join(", ")}.</p>`;
+  return h;
+}
+
+function kernelView(R, sel) {
+  if (!sel) return `<p>No block pair ran.</p>`;
+  if (sel.kind === "pruned") return `<div class="ij-panel"><p class="ij-narr">${sel.d.name} × ${sel.b.name} was pruned in 03, so the kernel never ran on it. Pick a solid cell to step through the kernel.</p></div>`;
+  const k = sel.k, d = sel.d, b = sel.b;
+  const lab = s => s > 0 ? d.rows[s - 1].id : b.rows[-s - 1].id;
+  const n = k.trace.length, step = Math.min(S.step, n);
+  const t = step ? k.trace[step - 1] : null;
+  const bits = t ? t.bits : new Array(k.l1.length).fill(false);
+  if (t && t.side === "R") bits[t.set] = true;
+  const l1 = k.l1.map((e, p) => `<span class="${e.s > 0 ? "ij-L" : "ij-R"}${bits[p] ? " ij-set" : ""}${t && t.side === "L" && p >= t.start ? " ij-scan" : ""}"><small>L1[${p}]</small>${esc(lab(e.s))}<small>k1 ${e.k1}</small></span>`).join("");
+  const l2 = k.l2.map((e, p) => `<span class="${e.s > 0 ? "ij-L" : "ij-R"}${t && t.pos === p ? " ij-cur" : ""}"><small>L2[${p}] → P=${k.P[p]}</small>${esc(lab(e.s))}<small>k2 ${e.k2}</small></span>`).join("");
+  const emitted = k.trace.slice(0, step).flatMap(x => x.side === "L" ? x.found.map(q => `${lab(x.s)}–${lab(k.l1[q].s)}`) : []);
+  let narr;
+  if (!t) narr = `Start. L1 is sorted by k1 ${dirAsc(R.op1) ? "ascending" : "descending"} (op1 is ${esc(R.op1)}); on equal k1, ${strict(R.op1) ? "build rows come first because op1 is strict" : "driver rows come first because op1 is inclusive"}. L2 is sorted by k2 ${dirAsc(R.op2) ? "descending" : "ascending"}, opposite to op2 (${esc(R.op2)}). P maps each L2 position to the same row's L1 position. eqOff is ${k.eqOff} (${k.eqOff ? "an operator is strict" : "both operators are inclusive"}). Step through L2.`;
+  else if (t.side === "R") narr = `L2[${t.pos}] is build row ${esc(lab(t.s))}. It sets bit ${t.set} (its L1 position): every driver processed later already satisfies op2 against it.`;
+  else narr = `L2[${t.pos}] is driver row ${esc(lab(t.s))}. Scan set bits from L1 position P + eqOff = ${t.start}: those build rows satisfy op1 (they are later in L1) and op2 (set earlier in L2). ${t.found.length ? `Matches: ${t.found.map(q => esc(lab(k.l1[q].s))).join(", ")}.` : "No match."}`;
+  return `<div class="ij-panel">
+    <p class="ij-aside">Block pair <b>${d.name} × ${b.name}</b>. Green: driver rows. Purple: build rows. Shaded: bit set. Underlined: the scanned range.</p>
+    <h3>L1 (by k1)</h3><div class="ij-arr" data-ij-l1>${l1}</div>
+    <h3>L2 (by k2)</h3><div class="ij-arr" data-ij-l2>${l2}</div>
+    <div class="ij-steprow"><button class="ij-btn" data-ij-step="reset">Reset</button><button class="ij-btn" data-ij-step="prev" ${step ? "" : "disabled"}>◀ Back</button><button class="ij-btn" data-ij-step="next" ${step < n ? "" : "disabled"}>Step ▶</button><button class="ij-btn" data-ij-step="all">Run all</button><span class="ij-legend">step ${step} / ${n}</span></div>
+    <p class="ij-narr" data-ij-narr>${narr}</p>
+    <p class="ij-aside">Matches so far: ${emitted.length ? emitted.map(esc).join(", ") : "none"}.</p>
+  </div>`;
+}
+
+function outNote() {
+  const m = S.mode;
+  let s = m === "first" ? "match: first keeps the candidate with the lowest build index (input order), whichever block pair found it." :
+          m === "all" ? "match: all writes every match." : "match: collect writes one row per driver with its matches as an array ordered by build index; a driver with none gets an empty array, and on_miss does not apply.";
+  if (m !== "collect") s += S.miss === "skip" ? " Unmatched drivers are dropped (on_miss: skip)." : " Unmatched drivers, from the scan pile and from blocks, are merged by driver index and written with null build fields (on_miss: null_fields).";
+  return s + " The output is sorted by driver index, then build index, so the result never depends on blocks, spill or pair order.";
+}
+
+document.querySelectorAll("[data-ij-bind]").forEach(g => g.querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+  S[g.dataset.ijBind] = b.dataset.v; if (g.dataset.ijBind !== "mode" && g.dataset.ijBind !== "miss") { S.pair = null; S.step = 0; } render();
+})));
+render();
+window.__ij = { simulate, kernel, possible, S, render };
+})();
+</script>
+</body>
+</html>
